@@ -48,6 +48,47 @@ echo [INFO] Using Python command:
 echo.
 
 REM ----------------------------------------
+REM Python version + architecture checks
+REM (Require: 3.11 <= Python <= 3.13, 64-bit)
+REM ----------------------------------------
+set "PY_MAJOR="
+set "PY_MINOR="
+set "PY_PATCH="
+set "PY_ARCH="
+set "PY_BITS="
+
+for /f %%A in ('%PY_CMD% -c "import sys; print(sys.version_info[0])"') do set PY_MAJOR=%%A
+for /f %%A in ('%PY_CMD% -c "import sys; print(sys.version_info[1])"') do set PY_MINOR=%%A
+for /f %%A in ('%PY_CMD% -c "import sys; print(sys.version_info[2])"') do set PY_PATCH=%%A
+
+if not defined PY_MAJOR goto PY_INFO_ERROR
+if not defined PY_MINOR goto PY_INFO_ERROR
+if not defined PY_PATCH goto PY_INFO_ERROR
+
+for /f %%A in ('%PY_CMD% -c "import platform; print(platform.architecture()[0])"') do set PY_ARCH=%%A
+if not defined PY_ARCH goto PY_INFO_ERROR
+
+set "PY_BITS=unknown"
+if /I "%PY_ARCH%"=="64bit" set "PY_BITS=64"
+if /I "%PY_ARCH%"=="32bit" set "PY_BITS=32"
+if "%PY_BITS%"=="unknown" goto PY_INFO_ERROR
+
+echo [INFO] Detected Python version: %PY_MAJOR%.%PY_MINOR%.%PY_PATCH% (%PY_BITS%-bit)
+echo.
+
+REM Require Python 3.x
+if not "%PY_MAJOR%"=="3" goto PY_VERSION_TOO_OLD
+
+REM Too old if < 3.11
+if %PY_MINOR% LSS 11 goto PY_VERSION_TOO_OLD
+
+REM Too high if > 3.13 (we allow 3.11, 3.12, 3.13)
+if %PY_MINOR% GTR 13 goto PY_VERSION_TOO_HIGH
+
+REM 32-bit not supported
+if "%PY_BITS%"=="32" goto PY_32BIT
+
+REM ----------------------------------------
 REM Step 1/3: Create venv if needed
 REM ----------------------------------------
 if not exist "%VENV_DIR%\Scripts\python.exe" (
@@ -188,3 +229,57 @@ echo.
 echo [INFO] Streamlit app has stopped.
 pause
 endlocal
+exit /b 0
+
+REM ----------------------------------------
+REM Error handlers for version / arch
+REM ----------------------------------------
+
+:PY_INFO_ERROR
+echo.
+echo [ERROR] Could not determine Python version or architecture.
+echo       Something looks wrong with the Python installation.
+echo.
+echo Please try:
+echo   - Running troubleshoot_python.bat
+echo   - Or reinstalling Python 3.11–3.13 (64-bit) from python.org
+echo.
+pause
+exit /b 1
+
+:PY_VERSION_TOO_OLD
+echo.
+echo [ERROR] Python version is too old: %PY_MAJOR%.%PY_MINOR%.%PY_PATCH%
+echo       This app requires Python 3.11 or newer (64-bit).
+echo.
+echo Please install Python 3.11–3.13 (64-bit) from:
+echo   https://www.python.org/downloads/windows/
+echo.
+pause
+exit /b 1
+
+:PY_VERSION_TOO_HIGH
+echo.
+echo [ERROR] Python version is newer than tested: %PY_MAJOR%.%PY_MINOR%.%PY_PATCH%
+echo       This app is tested with Python 3.11–3.13 (64-bit).
+echo       Newer versions may cause dependency issues.
+echo.
+echo Please install Python 3.11–3.13 (64-bit) from python.org
+echo and use that interpreter for this app.
+echo.
+pause
+exit /b 1
+
+:PY_32BIT
+echo.
+echo [ERROR] 32-bit Python detected.
+echo       32-bit Python is not supported for this app.
+echo       Libraries like pandas expect 64-bit Python on Windows.
+echo.
+echo Please:
+echo   1) Uninstall 32-bit Python
+echo   2) Install Python 3.11–3.13 (64-bit) from python.org
+echo   3) Run this launcher again
+echo.
+pause
+exit /b 1

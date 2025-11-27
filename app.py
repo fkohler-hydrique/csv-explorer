@@ -10,17 +10,32 @@ from pandas.api.types import is_object_dtype
 
 # ------------- Utility functions ------------- #
 
-def load_csv(file_or_path) -> pd.DataFrame:
-    """Load a CSV from an uploaded file or a path string."""
+def load_csv(file_or_path, sep: Optional[str] = None, decimal: str = ".") -> pd.DataFrame:
+    """Load a delimited text file from an uploaded file or a path string.
+
+    By default, the separator is auto-detected (comma / semicolon / tab / pipe),
+    but an explicit separator and decimal character can be passed in.
+    """
     if file_or_path is None:
         raise ValueError("No file or path provided.")
 
+    # Build read_csv keyword arguments
+    read_kwargs = {"decimal": decimal}
+
+    if sep is None:
+        # Auto-detect separator; requires the Python engine
+        read_kwargs.update(sep=None, engine="python")
+    else:
+        # Use the user-specified separator
+        read_kwargs["sep"] = sep
+
     if hasattr(file_or_path, "read"):
         # Uploaded file via Streamlit
-        return pd.read_csv(file_or_path)
+        return pd.read_csv(file_or_path, **read_kwargs)
     else:
         # Path string
-        return pd.read_csv(file_or_path)
+        return pd.read_csv(file_or_path, **read_kwargs)
+
 
 def make_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -38,35 +53,56 @@ def detect_date_column(df: pd.DataFrame, configured: Optional[str] = None) -> Op
     """Try to detect a date column; prefer configured name if present."""
     date_col = configured
 
-    if date_col is not None and date_col not in df.columns:
+    # If the configured date column is not valid, ignore it.
+    if date_col not in df.columns:
         date_col = None
 
+    # If no configured date column, try to guess one.
     if date_col is None:
-        for col in df.columns:
-            if col.lower() == "date":
-                date_col = col
-                break
+        for candidate in df.columns:
+            if "date" in candidate.lower():
+                try:
+                    pd.to_datetime(df[candidate])
+                    date_col = candidate
+                    break
+                except (ValueError, TypeError):
+                    continue
 
-    if date_col is None:
-        return None
+    # Final validation
+    if date_col is not None:
+        try:
+            pd.to_datetime(df[date_col])
+        except (ValueError, TypeError):
+            date_col = None
 
-    # Try to parse
-    parsed = pd.to_datetime(df[date_col], errors="coerce")
-    if parsed.isna().all():
-        return None
-
-    df[date_col] = parsed
     return date_col
 
 
-def filter_by_year_month(
-    df: pd.DataFrame, date_col: str, year: Optional[int], month: Optional[int]
+def parse_dates(df: pd.DataFrame, date_col: Optional[str]) -> pd.DataFrame:
+    """Convert date_col to datetime if present."""
+    if date_col and date_col in df.columns:
+        df = df.copy()
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    return df
+
+
+def filter_by_date(
+    df: pd.DataFrame,
+    date_col: Optional[str],
+    start_date: Optional[pd.Timestamp],
+    end_date: Optional[pd.Timestamp],
+    year: Optional[int],
+    month: Optional[int],
 ) -> pd.DataFrame:
-    """Filter dataframe by year and/or month if selected."""
-    if date_col is None:
+    """Apply date filters if a valid date column exists."""
+    if date_col is None or date_col not in df.columns:
         return df
 
     filtered = df.copy()
+    if start_date is not None:
+        filtered = filtered[filtered[date_col] >= start_date]
+    if end_date is not None:
+        filtered = filtered[filtered[date_col] <= end_date]
     if year is not None:
         filtered = filtered[filtered[date_col].dt.year == year]
     if month is not None:
@@ -74,43 +110,43 @@ def filter_by_year_month(
 
     return filtered
 
-def apply_date_range(df: pd.DataFrame, date_col: str, date_range) -> pd.DataFrame:
-    """Filter dataframe by a start/end date from a Streamlit date_input."""
-    if date_col is None or not date_range:
-        return df
 
-    start, end = date_range
-    if start is None or end is None:
-        return df
+def get_date_range(df: pd.DataFrame, date_col: Optional[str]):
+    """Return (min_date, max_date) if date_col is valid, otherwise (None, None)."""
+    if date_col is None or date_col not in df.columns:
+        return None, None
+    try:
+        dates = pd.to_datetime(df[date_col], errors="coerce")
+        return dates.min(), dates.max()
+    except (ValueError, TypeError):
+        return None, None
 
-    mask = (df[date_col] >= pd.Timestamp(start)) & (df[date_col] <= pd.Timestamp(end))
-    return df[mask]
 
-
-def apply_resample(df: pd.DataFrame, date_col: str, y_cols: List[str], rule: str) -> pd.DataFrame:
-    """Resample time series by rule (e.g. 'D', 'W', 'M')."""
-    if date_col is None or rule == "None":
-        return df
-
-    df_resampled = (
-        df.set_index(date_col)[y_cols]
-        .resample(rule)
-        .mean()
-        .reset_index()
+def plot_time_series(
+    df: pd.DataFrame,
+    date_col: str,
+    value_cols: List[str],
+    template: str = "plotly_white",
+):
+    """Create a time-series line chart with Plotly."""
+    melted = df.melt(id_vars=date_col, value_vars=value_cols, var_name="variable", value_name="value")
+    fig = px.line(
+        melted,
+        x=date_col,
+        y="value",
+        color="variable",
+        template=template,
     )
-    # Keep any extra non-numeric columns? For simplicity, we don't.
-    return df_resampled
-
-
-def apply_rolling(df: pd.DataFrame, y_cols: List[str], window: int) -> pd.DataFrame:
-    """Apply rolling mean to Y columns."""
-    if window <= 1:
-        return df
-
-    df_rolled = df.copy()
-    for col in y_cols:
-        df_rolled[col] = df_rolled[col].rolling(window=window, min_periods=1).mean()
-    return df_rolled
+    fig.update_layout(
+        title="Time Series",
+        xaxis_title=date_col,
+        yaxis_title="Value",
+        legend_title="Series",
+        margin=dict(l=40, r=20, t=40, b=40),
+    )
+    fig.update_xaxes(showgrid=True, zeroline=False)
+    fig.update_yaxes(showgrid=True, zeroline=False)
+    return fig
 
 
 def make_figure(
@@ -118,50 +154,62 @@ def make_figure(
     x_col: str,
     y_cols: List[str],
     plot_type: str,
-    color_col: Optional[str] = None,
     template: str = "plotly_white",
 ):
-    """Build a Plotly figure for given axes and type."""
+    """Create a Plotly figure based on the selected plot_type."""
     if not y_cols:
-        return None
+        raise ValueError("No y columns selected.")
 
-    # For multi-Y, we melt the dataframe
-    plot_df = df[[x_col] + y_cols].copy()
-    melted = plot_df.melt(id_vars=x_col, value_vars=y_cols, var_name="series", value_name="value")
+    if len(y_cols) == 1:
+        y = y_cols[0]
 
-    if plot_type == "Line":
-        fig = px.line(
-            melted,
-            x=x_col,
-            y="value",
-            color="series",
-            template=template,
-        )
-    elif plot_type == "Scatter":
-        fig = px.scatter(
-            melted,
-            x=x_col,
-            y="value",
-            color="series",
-            template=template,
-        )
-    elif plot_type == "Bar":
-        fig = px.bar(
-            melted,
-            x=x_col,
-            y="value",
-            color="series",
-            template=template,
-            barmode="group",
-        )
+        if plot_type == "line":
+            fig = px.line(df, x=x_col, y=y, template=template)
+        elif plot_type == "scatter":
+            fig = px.scatter(df, x=x_col, y=y, template=template)
+        elif plot_type == "bar":
+            fig = px.bar(df, x=x_col, y=y, template=template)
+        elif plot_type == "histogram":
+            fig = px.histogram(df, x=y, template=template)
+        else:
+            raise ValueError(f"Unsupported plot type: {plot_type}")
     else:
-        fig = px.line(
-            melted,
-            x=x_col,
-            y="value",
-            color="series",
-            template=template,
+        melted = df.melt(
+            id_vars=x_col,
+            value_vars=y_cols,
+            var_name="series",
+            value_name="value",
         )
+
+        if plot_type == "line":
+            fig = px.line(
+                melted,
+                x=x_col,
+                y="value",
+                color="series",
+                template=template,
+            )
+        elif plot_type == "scatter":
+            fig = px.scatter(
+                melted,
+                x=x_col,
+                y="value",
+                color="series",
+                template=template,
+            )
+        elif plot_type == "bar":
+            fig = px.bar(
+                melted,
+                x=x_col,
+                y="value",
+                color="series",
+                barmode="group",
+                template=template,
+            )
+        else:
+            raise ValueError(
+                "For multiple Y columns, only line, scatter, or bar are supported."
+            )
 
     fig.update_layout(
         title=f"{', '.join(y_cols)} vs {x_col}",
@@ -177,7 +225,26 @@ def make_figure(
     return fig
 
 
-# ------------- Streamlit app ------------- #
+def save_plot_config(
+    saved_plots: List[dict],
+    df: pd.DataFrame,
+    x_col: str,
+    y_cols: List[str],
+    plot_type: str,
+    template: str,
+):
+    """Append a new plot configuration to the list of saved plots."""
+    config = {
+        "data": df.copy(),
+        "x_col": x_col,
+        "y_cols": y_cols,
+        "plot_type": plot_type,
+        "template": template,
+    }
+    saved_plots.append(config)
+
+
+# ------------- Main app ------------- #
 
 def main():
     st.set_page_config(
@@ -199,12 +266,37 @@ def main():
     with col_path:
         csv_path = st.text_input("...or enter a CSV file path")
 
+    # --- File reading options (sidebar) --- #
+    st.sidebar.subheader("File reading options")
+
+    sep_label = st.sidebar.selectbox(
+        "Column separator",
+        ["Auto-detect", "Comma (,)", "Semicolon (;)", "Tab (\\t)", "Pipe (|)"],
+        index=0,
+    )
+
+    sep_map = {
+        "Auto-detect": None,
+        "Comma (,)": ",",
+        "Semicolon (;)": ";",
+        "Tab (\\t)": "\t",
+        "Pipe (|)": "|",
+    }
+    sep = sep_map[sep_label]
+
+    decimal_label = st.sidebar.selectbox(
+        "Decimal separator",
+        ["Dot (.)", "Comma (,)"],
+        index=0,
+    )
+    decimal = "." if decimal_label == "Dot (.)" else ","
+
     if not uploaded_file and not csv_path:
         st.info("Please upload a CSV or enter a valid path to begin.")
         st.stop()
 
     try:
-        df = load_csv(uploaded_file or csv_path)
+        df = load_csv(uploaded_file or csv_path, sep=sep, decimal=decimal)
     except Exception as e:
         st.error(f"Could not read CSV: {e}")
         st.stop()
@@ -219,9 +311,8 @@ def main():
         st.write("**Column types:**")
         st.write(df.dtypes.astype(str))
 
-        if st.toggle("Show basic statistics"):
-            stats = df.describe(include="all")
-            st.dataframe(make_arrow_safe(stats))
+        st.write("**Summary statistics (numeric columns):**")
+        st.write(df.describe(include="number").T)
 
     # --- Detect date column --- #
     st.sidebar.header("Settings")
@@ -238,141 +329,146 @@ def main():
 
     # --- Axis & plot controls --- #
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
-    if not numeric_cols:
-        st.error("No numeric columns found to plot.")
-        st.stop()
+    all_cols = df.columns.tolist()
 
-    # X-axis options: prefer date column
-    x_axis_options = []
-    if date_col is not None:
-        x_axis_options.append(date_col)
-    x_axis_options.extend([c for c in df.columns if c != date_col])
+    col_x, col_y, col_type = st.columns(3)
 
-    st.sidebar.subheader("Axes & Plot")
+    with col_x:
+        x_col = st.selectbox("X-axis column", options=all_cols)
 
-    x_col = st.sidebar.selectbox("X axis", options=x_axis_options)
-    y_cols = st.sidebar.multiselect(
-        "Y axis (numeric)", options=numeric_cols, default=numeric_cols[:1]
+    with col_y:
+        y_cols = st.multiselect(
+            "Y-axis column(s)",
+            options=numeric_cols,
+            default=numeric_cols[:1],
+            help="Only numeric columns can be selected for Y.",
+        )
+
+    with col_type:
+        plot_type = st.selectbox("Plot type", ["line", "scatter", "bar", "histogram"])
+
+    template = st.selectbox(
+        "Plotly theme",
+        ["plotly_white", "plotly_dark", "ggplot2", "seaborn", "simple_white"],
+        index=0,
     )
 
-    plot_type = st.sidebar.selectbox("Plot type", ["Line", "Scatter", "Bar"])
+    # --- Date filters (if date column is present) --- #
+    df = parse_dates(df, date_col)
+    min_date, max_date = get_date_range(df, date_col)
 
-    template = st.sidebar.selectbox("Plot theme", ["plotly_white", "plotly_dark", "ggplot2"])
+    start_date = None
+    end_date = None
+    year = None
+    month = None
 
-    # --- Time controls --- #
-    if date_col is not None:
-        st.sidebar.subheader("Time filtering")
+    if date_col and min_date is not None and max_date is not None:
+        st.sidebar.subheader("Date filtering")
 
-        years = sorted(df[date_col].dropna().dt.year.unique())
-        year = st.sidebar.selectbox("Year (optional)", options=["All"] + years, index=0)
-        if year == "All":
-            year = None
+        use_date_range = st.sidebar.checkbox(
+            "Filter by date range", value=False
+        )
 
-        months = list(range(1, 13))
-        month_labels = ["All", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        month_choice = st.sidebar.selectbox("Month (optional)", options=month_labels, index=0)
-
-        if month_choice == "All":
-            month = None
-        else:
-            month = month_labels.index(month_choice)  # 1-based
-
-        # Optional date-range filter
-        if st.sidebar.checkbox("Use date range filter instead of year/month"):
-            min_date = df[date_col].min()
-            max_date = df[date_col].max()
-            date_range = st.sidebar.date_input(
-                "Date range",
-                value=(min_date, max_date),
-                min_value=min_date,
-                max_value=max_date,
+        if use_date_range:
+            start_date = st.sidebar.date_input(
+                "Start date", value=min_date.date()
             )
-        else:
-            date_range = None
-    else:
-        year = None
-        month = None
-        date_range = None
+            end_date = st.sidebar.date_input(
+                "End date", value=max_date.date()
+            )
+            start_date = pd.to_datetime(start_date)
+            end_date = pd.to_datetime(end_date)
 
-    # --- Resampling & smoothing --- #
-    st.sidebar.subheader("Aggregation & smoothing")
+        use_year_month = st.sidebar.checkbox(
+            "Filter by year/month", value=False
+        )
 
-    resample_rule = st.sidebar.selectbox(
-        "Resample (if X is date)",
-        options=["None", "Day", "Week", "Month"],
-        help="Aggregate numeric Y columns over time.",
-    )
-    rule_map = {"None": "None", "Day": "D", "Week": "W", "Month": "M"}
+        if use_year_month:
+            years = sorted(df[date_col].dt.year.dropna().unique())
+            year = st.sidebar.selectbox("Year", options=[None] + list(years), index=0)
 
-    rolling_window = st.sidebar.slider(
-        "Rolling mean window (points)", min_value=1, max_value=60, value=1
-    )
-
-    # --- Filtering and transformation --- #
-    df_filtered = df.copy()
-
-    if date_col is not None:
-        df_filtered = filter_by_year_month(df_filtered, date_col, year, month)
-        df_filtered = apply_date_range(df_filtered, date_col, date_range)
-
-    # Resample only if x_col is the date column and a rule is chosen
-    if date_col is not None and x_col == date_col and resample_rule != "None":
-        df_filtered = apply_resample(df_filtered, date_col, y_cols, rule_map[resample_rule])
-
-    if rolling_window > 1 and y_cols:
-        df_filtered = apply_rolling(df_filtered, y_cols, window=rolling_window)
-
-    # --- Main plot area --- #
-    left, right = st.columns([3, 1])
-
-    with left:
-        st.subheader("Live plot")
-        if not y_cols:
-            st.info("Select at least one Y-axis column to see a plot.")
-        else:
-            fig = make_figure(df_filtered, x_col, y_cols, plot_type, template=template)
-            if fig is not None:
-                st.plotly_chart(fig, width="stretch", key="live_plot")
-            else:
-                st.info("Could not build figure – check your selections.")
-
-    with right:
-        st.subheader("Actions")
-
-        # Initialize saved plots in session state
-        if "saved_plots" not in st.session_state:
-            st.session_state["saved_plots"] = []
-
-        if st.button("📌 Keep current plot"):
-            if y_cols:
-                st.session_state["saved_plots"].append(
-                    {
-                        "x_col": x_col,
-                        "y_cols": list(y_cols),
-                        "plot_type": plot_type,
-                        "template": template,
-                        "data": df_filtered.copy(),
-                    }
+            if year is not None:
+                months = sorted(
+                    df.loc[df[date_col].dt.year == year, date_col].dt.month.dropna().unique()
                 )
-                st.success("Plot kept.")
+                month = st.sidebar.selectbox(
+                    "Month", options=[None] + list(months), index=0
+                )
+
+    filtered_df = filter_by_date(df, date_col, start_date, end_date, year, month)
+
+    st.write(f"**Filtered data shape:** {filtered_df.shape[0]} rows × {filtered_df.shape[1]} columns")
+
+    # --- Plotting --- #
+    st.subheader("📈 Visualization")
+
+    if not y_cols:
+        st.warning("Please select at least one numeric Y column.")
+    else:
+        try:
+            if date_col and x_col == date_col and plot_type == "line":
+                fig = plot_time_series(filtered_df, date_col, y_cols, template=template)
             else:
-                st.warning("Select at least one Y column before keeping a plot.")
+                fig = make_figure(filtered_df, x_col, y_cols, plot_type, template=template)
 
-        # Download filtered data
-        if st.button("⬇️ Download filtered data as CSV"):
-            buffer = io.StringIO()
-            df_filtered.to_csv(buffer, index=False)
-            st.download_button(
-                "Download now",
-                data=buffer.getvalue(),
-                file_name="filtered_data.csv",
-                mime="text/csv",
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error generating plot: {e}")
+
+    # --- Save plots --- #
+    st.subheader("💾 Save plot configurations")
+
+    if "saved_plots" not in st.session_state:
+        st.session_state["saved_plots"] = []
+
+    if st.button("Save current plot configuration"):
+        try:
+            save_plot_config(
+                st.session_state["saved_plots"],
+                filtered_df,
+                x_col,
+                y_cols,
+                plot_type,
+                template,
             )
+            st.success("Plot configuration saved!")
+        except Exception as e:
+            st.error(f"Could not save plot configuration: {e}")
 
-    # --- Display kept plots --- #
     if st.session_state["saved_plots"]:
-        st.subheader("📌 Kept plots")
+        st.subheader("🗂 Saved plots")
+        for i, p in enumerate(st.session_state["saved_plots"], start=1):
+            st.markdown(f"**Saved plot #{i}:** {', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})")
+            fig_saved = make_figure(
+                p["data"],
+                p["x_col"],
+                p["y_cols"],
+                p["plot_type"],
+                template=p["template"],
+            )
+            st.plotly_chart(fig_saved, use_container_width=True, key=f"saved_plot_{i}")
+
+    # --- Keep / discard plots --- #
+    st.subheader("🧹 Manage plots")
+
+    if st.session_state["saved_plots"]:
+        keep_indices = []
+        for i, p in enumerate(st.session_state["saved_plots"], start=1):
+            keep = st.checkbox(
+                f"Keep plot #{i}: {', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})",
+                value=True,
+            )
+            if keep:
+                keep_indices.append(i - 1)
+
+        if st.button("Apply keep/discard selection"):
+            st.session_state["saved_plots"] = [
+                p for j, p in enumerate(st.session_state["saved_plots"]) if j in keep_indices
+            ]
+            st.success("Updated saved plots list!")
+
+    if st.session_state["saved_plots"]:
+        st.subheader("📚 Kept plots")
         for i, p in enumerate(st.session_state["saved_plots"], start=1):
             st.markdown(f"**Kept plot #{i}:** {', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})")
             fig_saved = make_figure(
@@ -382,8 +478,7 @@ def main():
                 p["plot_type"],
                 template=p["template"],
             )
-            st.plotly_chart(fig_saved, width="stretch", key=f"kept_plot_{i}")
-
+            st.plotly_chart(fig_saved, use_container_width=True, key=f"kept_plot_{i}")
 
 
 if __name__ == "__main__":
