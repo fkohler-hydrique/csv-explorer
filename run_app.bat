@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal ENABLEDELAYEDEXPANSION
 
 REM ----------------------------------------
 REM Change to the directory of this script
@@ -35,14 +35,44 @@ if not defined PY_CMD (
 
 if not defined PY_CMD (
     echo [ERROR] No Python installation found via "py -3" or "python".
-    echo Make sure Python 3 is installed.
+    echo Make sure Python 3.11 (recommended) is installed.
     echo You can also run troubleshoot_python.bat for more help.
     echo.
     pause
     exit /b 1
 )
 
-echo [INFO] Using Python command: %PY_CMD%
+REM ----------------------------------------
+REM Check Python version (require 3.9–3.12, recommend 3.11)
+REM ----------------------------------------
+for /f "tokens=2" %%v in ('%PY_CMD% --version') do set PY_VER=%%v
+
+for /f "tokens=1,2 delims=." %%a in ("!PY_VER!") do (
+    set "PY_MAJOR=%%a"
+    set "PY_MINOR=%%b"
+)
+
+echo [INFO] Detected Python version: !PY_VER!
+
+if NOT "!PY_MAJOR!"=="3" (
+    echo [ERROR] Unsupported Python major version: !PY_MAJOR!
+    echo Please install Python 3.11 (recommended) and try again.
+    pause
+    exit /b 1
+)
+
+REM Block too-new versions (e.g. 3.13, where pandas wheels may be missing)
+if !PY_MINOR! GEQ 13 (
+    echo [ERROR] Python 3.!PY_MINOR! is currently too new for this app.
+    echo Some dependencies (like pandas) do not provide ready-made wheels and
+    echo would require a full C++ build toolchain.
+    echo.
+    echo Please install Python 3.11 (recommended) or 3.12 instead, then run this script again.
+    pause
+    exit /b 1
+)
+
+echo [INFO] Python version is acceptable.
 echo.
 
 REM ----------------------------------------
@@ -91,6 +121,11 @@ python -m pip install --no-input --quiet -r requirements.txt >pip_install.log 2>
 
 if errorlevel 1 (
     echo [ERROR] Failed to install required packages.
+    echo Possible causes:
+    echo   - Unsupported Python version
+    echo   - Network issues
+    echo   - Broken pip cache
+    echo.
     echo See details below (from pip_install.log):
     echo ----------------------------------------
     type pip_install.log
