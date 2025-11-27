@@ -22,31 +22,23 @@ REM Priority: py -3.13, then py -3.12, then py -3.11, then python
 REM ----------------------------------------
 set "PY_CMD="
 
-py -3.13 --version >nul 2>&1
-if %ERRORLEVEL%==0 set "PY_CMD=py -3.13"
-
-if not defined PY_CMD (
-    py -3.12 --version >nul 2>&1
-    if %ERRORLEVEL%==0 set "PY_CMD=py -3.12"
-)
-
-if not defined PY_CMD (
-    py -3.11 --version >nul 2>&1
-    if %ERRORLEVEL%==0 set "PY_CMD=py -3.11"
-)
-
-if not defined PY_CMD (
-    python --version >nul 2>&1
-    if %ERRORLEVEL%==0 set "PY_CMD=python"
-)
+py -3.13 --version >nul 2>&1 && set "PY_CMD=py -3.13"
+if not defined PY_CMD py -3.12 --version >nul 2>&1 && set "PY_CMD=py -3.12"
+if not defined PY_CMD py -3.11 --version >nul 2>&1 && set "PY_CMD=py -3.11"
+if not defined PY_CMD python --version >nul 2>&1 && set "PY_CMD=python"
 
 if not defined PY_CMD (
     echo [ERROR] No Python installation found via:
     echo         py -3.13, py -3.12, py -3.11 or python
     echo.
+    echo This usually means Python is installed but not on PATH, or
+    echo the "py" launcher was not installed.
+    echo.
     echo Please install Python 3.11+ (3.11, 3.12 or 3.13 recommended)
     echo from https://www.python.org/downloads/windows/
-    echo and make sure the "py" launcher or "python" is in PATH.
+    echo and make sure:
+    echo   - "Install launcher for all users" is checked
+    echo   - (optionally) "Add python.exe to PATH" is checked
     echo.
     echo You can also run troubleshoot_python.bat for more help.
     echo.
@@ -54,7 +46,7 @@ if not defined PY_CMD (
     exit /b 1
 )
 
-echo [INFO] Using Python command:
+echo [INFO] Using Python command: %PY_CMD%
 %PY_CMD% --version
 echo.
 
