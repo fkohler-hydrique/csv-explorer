@@ -15,12 +15,12 @@ All data stays **local on your machine**. The app runs on your computer and open
 
 ## 1. Requirements
 
-- **OS**: Windows 11
+- **OS**: Windows 11  
 - **Python**: 3.10+ installed  
-  - On Windows, the `py` launcher should be available (you can test this by running `py --version` in a terminal).
-- **Git** (recommended) to clone the repository
+  - The `py` launcher is recommended (you should be able to run `py --version` in a terminal).
+- **Git** to clone the repository (optional but recommended)
 
-No additional tools are required. All Python packages are installed automatically in a virtual environment.
+No manual package installation is needed if you use the provided batch file.
 
 ---
 
