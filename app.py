@@ -1,437 +1,970 @@
-from typing import Dict, List, Any, Tuple
+import io
+import os
+import pickle
+from typing import List, Optional
 
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from plotly.colors import qualitative
+import plotly.express as px
 import streamlit as st
+from pandas.api.types import is_object_dtype
+from plotly.subplots import make_subplots
+
+# ------------- Configuration & constants ------------- #
+
+CANDIDATE_SEPARATORS = [",", ";", "\t", "|"]
+DATE_KEYWORDS = ("date", "time", "datum", "zeit", "datetime")
+SAVED_PLOTS_FILE = "saved_plots.pkl"
 
 
-# --------------------------------------------------------------------
-# Utility functions
-# --------------------------------------------------------------------
+def detect_separator_from_sample(sample: str, decimal: str = ".") -> Optional[str]:
+    """Heuristically detect the field separator from a text sample."""
+    lines = [line for line in sample.splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    best_sep: Optional[str] = None
+    best_score: float = 0.0
+
+    for sep in CANDIDATE_SEPARATORS:
+        if sep == decimal:
+            continue
+
+        counts = [line.count(sep) for line in lines[:25]]
+        if not counts or max(counts) == 0:
+            continue
+
+        mean_count = sum(counts) / len(counts)
+        variance = sum((c - mean_count) ** 2 for c in counts) / len(counts)
+        score = mean_count - variance
+        if score > best_score:
+            best_score = score
+            best_sep = sep
+
+    return best_sep
 
 
-def init_session_state():
-    if "saved_plots" not in st.session_state:
-        st.session_state["saved_plots"] = []  # list[dict]
-    if "last_uploaded_name" not in st.session_state:
-        st.session_state["last_uploaded_name"] = None
+def load_saved_plots_from_disk() -> List[dict]:
+    """Load saved plots from disk if available."""
+    if not os.path.exists(SAVED_PLOTS_FILE):
+        return []
+    try:
+        with open(SAVED_PLOTS_FILE, "rb") as f:
+            data = pickle.load(f)
+        if isinstance(data, list):
+            return [p for p in data if isinstance(p, dict)]
+    except Exception:
+        pass
+    return []
 
 
-def line_dash_options() -> Dict[str, str]:
-    return {
-        "Solid": "solid",
-        "Dash": "dash",
-        "Dot": "dot",
-        "Dashdot": "dashdot",
-        "Long dash": "longdash",
-        "Long dashdot": "longdashdot",
-    }
+def persist_saved_plots_to_disk(saved_plots: List[dict]) -> None:
+    """Persist the list of saved plots to disk (best-effort)."""
+    try:
+        with open(SAVED_PLOTS_FILE, "wb") as f:
+            pickle.dump(saved_plots, f)
+    except Exception:
+        pass
 
 
-def compute_subplot_grid(n: int) -> Tuple[int, int]:
-    """Return (rows, cols) for up to 8 plots, reasonably compact."""
-    if n <= 1:
-        return 1, 1
-    if n == 2:
-        return 1, 2
-    if n <= 4:
-        return 2, 2
-    if n <= 6:
-        return 3, 2
-    return 4, 2  # up to 8
+# ------------- Utility functions ------------- #
+
+def load_csv(
+    file_or_path,
+    sep: Optional[str] = None,
+    decimal: str = ".",
+    header="infer",
+    skiprows=None,
+) -> pd.DataFrame:
+    """Load a delimited text file from an uploaded file or a path string.
+
+    Tries UTF-8 first, then falls back to latin-1 if decoding fails.
+    """
+    if file_or_path is None:
+        raise ValueError("No file or path provided.")
+
+    read_kwargs = {"decimal": decimal, "header": header}
+    if skiprows is not None:
+        read_kwargs["skiprows"] = skiprows
+
+    if sep is None:
+        read_kwargs.update(sep=None, engine="python")
+    else:
+        read_kwargs["sep"] = sep
+
+    def _read_with_encoding(enc: Optional[str]):
+        # Copy kwargs so we don't mutate between attempts
+        kwargs = dict(read_kwargs)
+        if enc is not None:
+            kwargs["encoding"] = enc
+        # If it's an uploaded file, rewind the buffer before each attempt
+        if hasattr(file_or_path, "read"):
+            try:
+                file_or_path.seek(0)
+            except Exception:
+                pass
+            return pd.read_csv(file_or_path, **kwargs)
+        else:
+            return pd.read_csv(file_or_path, **kwargs)
+
+    # Try UTF-8 first, then latin-1 as a fallback
+    try:
+        return _read_with_encoding("utf-8")
+    except UnicodeDecodeError:
+        return _read_with_encoding("latin-1")
 
 
-def build_single_plot_figure(
+def make_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert object columns to plain Python strings for Streamlit/Arrow."""
+    safe = df.copy()
+    for col in safe.columns:
+        if is_object_dtype(safe[col].dtype):
+            safe[col] = safe[col].astype(str)
+    return safe
+
+
+def detect_date_column(df: pd.DataFrame, configured: Optional[str] = None) -> Optional[str]:
+    """Try to detect a date/time column; prefer configured name if present."""
+    date_col = configured if configured in df.columns else None
+
+    if date_col is None:
+        for candidate in df.columns:
+            lower = candidate.lower()
+            if any(keyword in lower for keyword in DATE_KEYWORDS):
+                try:
+                    pd.to_datetime(df[candidate])
+                    date_col = candidate
+                    break
+                except (ValueError, TypeError):
+                    continue
+
+    if date_col is not None:
+        try:
+            pd.to_datetime(df[date_col])
+        except (ValueError, TypeError):
+            date_col = None
+
+    return date_col
+
+
+def parse_dates(df: pd.DataFrame, date_col: Optional[str]) -> pd.DataFrame:
+    """Convert date_col to datetime if present."""
+    if date_col and date_col in df.columns:
+        df = df.copy()
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    return df
+
+
+def filter_by_date(
+    df: pd.DataFrame,
+    date_col: Optional[str],
+    start_date: Optional[pd.Timestamp],
+    end_date: Optional[pd.Timestamp],
+    year: Optional[int],
+    month: Optional[int],
+) -> pd.DataFrame:
+    """Filter df by date range and/or year/month selections."""
+    if date_col is None or date_col not in df.columns:
+        return df
+
+    filtered = df.copy()
+
+    if start_date is not None:
+        filtered = filtered[filtered[date_col] >= start_date]
+    if end_date is not None:
+        filtered = filtered[filtered[date_col] <= end_date]
+    if year is not None:
+        filtered = filtered[filtered[date_col].dt.year == year]
+    if month is not None:
+        filtered = filtered[filtered[date_col].dt.month == month]
+
+    return filtered
+
+
+def get_date_range(df: pd.DataFrame, date_col: Optional[str]):
+    """Return (min_date, max_date) if date_col is valid, otherwise (None, None)."""
+    if date_col is None or date_col not in df.columns:
+        return None, None
+    try:
+        dates = pd.to_datetime(df[date_col], errors="coerce")
+        return dates.min(), dates.max()
+    except (ValueError, TypeError):
+        return None, None
+
+
+def apply_series_styles(fig, styles: Optional[dict]) -> None:
+    """Apply per-series style (color, width, dash) to a Plotly figure."""
+    if not styles:
+        return
+
+    for trace in fig.data:
+        name = getattr(trace, "name", None)
+        if not name:
+            continue
+        s = styles.get(name)
+        if not s:
+            continue
+        line_kwargs = {}
+        if s.get("color"):
+            line_kwargs["color"] = s["color"]
+        if s.get("width") is not None:
+            line_kwargs["width"] = s["width"]
+        if s.get("dash"):
+            line_kwargs["dash"] = s["dash"]
+        if line_kwargs:
+            trace.update(line=line_kwargs)
+
+
+def plot_time_series(
+    df: pd.DataFrame,
+    date_col: str,
+    value_cols: List[str],
+    template: str = "plotly_white",
+    title: Optional[str] = None,
+    styles: Optional[dict] = None,
+):
+    """Create a time-series line chart with Plotly."""
+    melted = df.melt(id_vars=date_col, value_vars=value_cols, var_name="variable", value_name="value")
+    fig = px.line(
+        melted,
+        x=date_col,
+        y="value",
+        color="variable",
+        template=template,
+    )
+    default_title = "Time Series"
+    fig.update_layout(
+        title=title or default_title,
+        xaxis_title=date_col,
+        yaxis_title="Value",
+        legend_title="Series",
+        margin=dict(l=40, r=20, t=40, b=40),
+    )
+    fig.update_xaxes(showgrid=True, zeroline=False)
+    fig.update_yaxes(showgrid=True, zeroline=False)
+
+    apply_series_styles(fig, styles)
+    return fig
+
+
+def make_figure(
     df: pd.DataFrame,
     x_col: str,
     y_cols: List[str],
     plot_type: str,
-    y_styles: Dict[str, Dict[str, Any]],
     template: str = "plotly_white",
-) -> go.Figure:
-    """Create a single Plotly figure for one plot configuration."""
-    fig = go.Figure()
-    x = df[x_col]
+    title: Optional[str] = None,
+    styles: Optional[dict] = None,
+):
+    """Create a Plotly figure based on the selected plot_type."""
+    if not y_cols:
+        raise ValueError("No y columns selected.")
 
-    for idx, y in enumerate(y_cols):
-        style = y_styles.get(y, {})
-        dash = style.get("dash", "solid")
-        width = style.get("width", 2)
-        color = style.get("color", qualitative.Plotly[idx % len(qualitative.Plotly)])
+    if len(y_cols) == 1:
+        y = y_cols[0]
 
-        if plot_type == "bar":
-            fig.add_bar(
-                x=x,
-                y=df[y],
-                name=y,
-                marker=dict(color=color),
+        if plot_type == "line":
+            fig = px.line(df, x=x_col, y=y, template=template)
+        elif plot_type == "scatter":
+            fig = px.scatter(df, x=x_col, y=y, template=template)
+        elif plot_type == "bar":
+            fig = px.bar(df, x=x_col, y=y, template=template)
+        elif plot_type == "histogram":
+            fig = px.histogram(df, x=y, template=template)
+        else:
+            raise ValueError(f"Unsupported plot type: {plot_type}")
+    else:
+        melted = df.melt(
+            id_vars=x_col,
+            value_vars=y_cols,
+            var_name="series",
+            value_name="value",
+        )
+
+        if plot_type == "line":
+            fig = px.line(
+                melted,
+                x=x_col,
+                y="value",
+                color="series",
+                template=template,
+            )
+        elif plot_type == "scatter":
+            fig = px.scatter(
+                melted,
+                x=x_col,
+                y="value",
+                color="series",
+                template=template,
+            )
+        elif plot_type == "bar":
+            fig = px.bar(
+                melted,
+                x=x_col,
+                y="value",
+                color="series",
+                barmode="group",
+                template=template,
             )
         else:
-            mode = "lines" if plot_type in ["line", "lines"] else "lines+markers"
-            fig.add_trace(
-                go.Scatter(
-                    x=x,
-                    y=df[y],
-                    mode=mode,
-                    name=y,
-                    line=dict(dash=dash, width=width, color=color),
-                )
+            raise ValueError(
+                "For multiple Y columns, only line, scatter, or bar are supported."
             )
 
+    default_title = f"{', '.join(y_cols)} vs {x_col}"
     fig.update_layout(
-        template=template,
+        title=title or default_title,
         xaxis_title=x_col,
-        yaxis_title=", ".join(y_cols),
-        legend_title_text="Series",
+        yaxis_title=" / ".join(y_cols),
+        legend_title="Series",
         margin=dict(l=40, r=20, t=40, b=40),
     )
+    fig.update_xaxes(showgrid=True, zeroline=False)
+    fig.update_yaxes(showgrid=True, zeroline=False)
+
+    apply_series_styles(fig, styles)
     return fig
 
 
-def build_comparison_figure(
-    plot_configs: List[Dict[str, Any]],
-    sync_x: bool = True,
-) -> go.Figure:
-    """
-    Build a comparison figure with multiple subplots from saved plot configs.
+def save_plot_config(
+    saved_plots: List[dict],
+    df: pd.DataFrame,
+    x_col: str,
+    y_cols: List[str],
+    plot_type: str,
+    template: str,
+    label: Optional[str] = None,
+    styles: Optional[dict] = None,
+):
+    """Append a new plot configuration to the list of saved plots."""
+    styles_for_plot = None
+    if styles:
+        styles_for_plot = {k: v for k, v in styles.items() if k in y_cols}
 
-    Each element in plot_configs is a dict with:
-      - 'data' : dataframe
-      - 'x_col'
-      - 'y_cols'
-      - 'plot_type'
-      - 'template'
-      - 'y_styles'
-      - 'label' (optional)
-    """
-    n = len(plot_configs)
-    rows, cols = compute_subplot_grid(n)
+    config = {
+        "data": make_arrow_safe(df.copy()),
+        "x_col": x_col,
+        "y_cols": y_cols,
+        "plot_type": plot_type,
+        "template": template,
+        "label": label,
+        "styles": styles_for_plot,
+    }
+    saved_plots.append(config)
+    persist_saved_plots_to_disk(saved_plots)
 
-    fig = make_subplots(
-        rows=rows,
-        cols=cols,
-        shared_xaxes=False,  # we will control matching manually
-        subplot_titles=[
-            cfg.get("label", f"Plot {i + 1}") for i, cfg in enumerate(plot_configs)
-        ],
-    )
 
-    dash_map = line_dash_options()
-    dash_values = list(dash_map.values())
+def compute_global_x_range(saved_plots: List[dict], indices: List[int]):
+    """Compute global x-range (min, max) across given saved plots."""
+    global_xmin = None
+    global_xmax = None
 
-    for i, cfg in enumerate(plot_configs):
-        r = i // cols + 1
-        c = i % cols + 1
-
-        df = cfg["data"]
-        x_col = cfg["x_col"]
-        y_cols = cfg["y_cols"]
-        plot_type = cfg.get("plot_type", "line")
-        y_styles = cfg.get("y_styles", {})
-
-        x = df[x_col]
-
-        for j, y in enumerate(y_cols):
-            style = y_styles.get(y, {})
-            dash = style.get("dash", dash_values[j % len(dash_values)])
-            width = style.get("width", 2)
-            color = style.get(
-                "color", qualitative.Plotly[j % len(qualitative.Plotly)]
-            )
-
-            if plot_type == "bar":
-                fig.add_bar(
-                    x=x,
-                    y=df[y],
-                    name=f"{cfg.get('label', f'Plot {i+1}')}: {y}",
-                    row=r,
-                    col=c,
-                )
+    for idx in indices:
+        p = saved_plots[idx]
+        x_name = p["x_col"]
+        if x_name not in p["data"].columns:
+            continue
+        s = p["data"][x_name]
+        try:
+            v = pd.to_datetime(s, errors="coerce")
+            if v.notna().any():
+                vals = v
             else:
-                mode = "lines" if plot_type in ["line", "lines"] else "lines+markers"
-                fig.add_trace(
-                    go.Scatter(
-                        x=x,
-                        y=df[y],
-                        mode=mode,
-                        name=f"{cfg.get('label', f'Plot {i+1}')}: {y}",
-                        line=dict(dash=dash, width=width, color=color),
-                        showlegend=False,  # keep legend smaller
-                    ),
-                    row=r,
-                    col=c,
-                )
+                vals = pd.to_numeric(s, errors="coerce")
+        except Exception:
+            vals = pd.to_numeric(s, errors="coerce")
+        vals = vals.dropna()
+        if vals.empty:
+            continue
+        local_min = vals.min()
+        local_max = vals.max()
+        if global_xmin is None or local_min < global_xmin:
+            global_xmin = local_min
+        if global_xmax is None or local_max > global_xmax:
+            global_xmax = local_max
 
-        fig.update_xaxes(title_text=x_col, row=r, col=c)
-        fig.update_yaxes(title_text=", ".join(y_cols), row=r, col=c)
-
-    # Global x-sync / de-sync
-    if sync_x:
-        # All x-axes follow the same range
-        fig.update_xaxes(matches="x")
-    else:
-        # Remove matches so that all subplots are independent again
-        for ax_name in fig.layout:
-            if isinstance(ax_name, str) and ax_name.startswith("xaxis"):
-                axis = fig.layout[ax_name]
-                if hasattr(axis, "matches"):
-                    axis.matches = None
-
-    fig.update_layout(
-        template="plotly_white",
-        margin=dict(l=40, r=20, t=60, b=40),
-        height=max(400, 280 * rows),
-    )
-    return fig
+    return global_xmin, global_xmax
 
 
-# --------------------------------------------------------------------
-# Main app
-# --------------------------------------------------------------------
-
+# ------------- Main app ------------- #
 
 def main():
     st.set_page_config(
-        page_title="CSV Explorer",
+        page_title="Interactive CSV Explorer",
         layout="wide",
     )
 
-    init_session_state()
-
-    st.title("CSV Explorer")
-
-    # ----------------------------------------------------------------
-    # Sidebar: upload (kept simple, like before)
-    # ----------------------------------------------------------------
-    st.sidebar.header("1. Data")
-    uploaded_file = st.sidebar.file_uploader(
-        "Upload a CSV file", type=["csv"], key="csv_uploader"
+    st.title("📊 Interactive CSV Explorer")
+    st.markdown(
+        "Upload a CSV or provide a file path, then interactively explore and visualize your data."
     )
 
-    if uploaded_file is None:
-        st.info("Upload a CSV file to get started.")
-        return
+    # --- Initialize session state --- #
+    if "saved_plots" not in st.session_state:
+        st.session_state["saved_plots"] = load_saved_plots_from_disk()
+    if "series_styles" not in st.session_state:
+        st.session_state["series_styles"] = {}
 
-    df = pd.read_csv(uploaded_file)
-    st.session_state["last_uploaded_name"] = uploaded_file.name
+    # --- File input section --- #
+    col_file, col_path = st.columns(2)
 
-    all_cols = list(df.columns)
-    if not all_cols:
-        st.warning("No columns detected in this CSV.")
-        return
+    with col_file:
+        uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
 
-    # ----------------------------------------------------------------
-    # MAIN AREA: data preview + basic stats (with hide option)
-    # ----------------------------------------------------------------
-    with st.expander("Data preview & statistics (click to show/hide)", expanded=True):
-        st.subheader("Data preview")
-        st.dataframe(df.head(100))
+    with col_path:
+        csv_path = st.text_input("...or enter a CSV file path")
 
-        st.markdown("**Shape**")
-        st.write(df.shape)
+    # --- File reading options (sidebar) --- #
+    st.sidebar.subheader("File reading options")
 
-        st.markdown("**Summary statistics**")
-        # include='all' to try to match previous behavior (numeric + non-numeric)
+    sep_label = st.sidebar.selectbox(
+        "Column separator",
+        ["Auto-detect", "Comma (,)", "Semicolon (;)", "Tab (\\t)", "Pipe (|)"],
+        index=0,
+    )
+
+    sep_map = {
+        "Auto-detect": None,
+        "Comma (,)": ",",
+        "Semicolon (;)": ";",
+        "Tab (\\t)": "\t",
+        "Pipe (|)": "|",
+    }
+    sep = sep_map[sep_label]
+
+    decimal_label = st.sidebar.selectbox(
+        "Decimal separator",
+        ["Dot (.)", "Comma (,)"],
+        index=0,
+    )
+    decimal = "." if decimal_label == "Dot (.)" else ","
+
+    # --- Header options (sidebar) --- #
+    st.sidebar.subheader("Header options")
+
+    header_label = st.sidebar.selectbox(
+        "Header row(s)",
+        [
+            "First row only",
+            "Second row only (skip first row)",
+            "First two rows (multi-line header)",
+            "No header (use generic column names)",
+        ],
+        index=0,
+    )
+
+    header = "infer"
+    skiprows = None
+    if header_label == "First row only":
+        header = 0
+        skiprows = None
+    elif header_label == "Second row only (skip first row)":
+        header = 0
+        skiprows = [0]
+    elif header_label == "First two rows (multi-line header)":
+        header = [0, 1]
+        skiprows = None
+    elif header_label == "No header (use generic column names)":
+        header = None
+        skiprows = None
+
+    if not uploaded_file and not csv_path:
+        st.info("Please upload a CSV or enter a valid path to begin.")
+        st.stop()
+
+    # Decide input source and, if needed, auto-detect the separator
+    file_source = uploaded_file or csv_path
+    detected_sep = None
+    effective_sep = sep
+
+    if sep is None:
         try:
-            st.dataframe(df.describe(include="all").transpose())
+            if uploaded_file is not None:
+                raw_bytes = uploaded_file.getvalue()
+            else:
+                with open(csv_path, "rb") as f:
+                    raw_bytes = f.read(8192)
+
+            try:
+                sample_text = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                sample_text = raw_bytes.decode("latin-1", errors="ignore")
+
+            detected_sep = detect_separator_from_sample(sample_text, decimal=decimal)
         except Exception:
-            st.dataframe(df.describe().transpose())
+            detected_sep = None
 
-    # ----------------------------------------------------------------
-    # MAIN AREA: plot selection (x/y) – as you preferred before
-    # ----------------------------------------------------------------
-    st.markdown("---")
-    st.subheader("Plot selection")
+        if detected_sep:
+            effective_sep = detected_sep
+            st.sidebar.info(f"Auto-detected separator: {repr(detected_sep)}")
+        else:
+            effective_sep = None
+            st.sidebar.warning(
+                "Could not reliably detect the separator. "
+                "If the preview looks wrong, please choose a separator manually."
+            )
+    else:
+        effective_sep = sep
 
-    default_x = all_cols[0]
-    col_x, col_y = st.columns(2)
+    try:
+        df = load_csv(
+            file_source,
+            sep=effective_sep,
+            decimal=decimal,
+            header=header,
+            skiprows=skiprows,
+        )
+    except Exception as e:
+        st.error(f"Could not read CSV: {e}")
+        st.stop()
+
+    st.success(f"Loaded data with shape: {df.shape[0]} rows × {df.shape[1]} columns")
+
+    # --- Data overview --- #
+    with st.expander("🔍 Data preview & summary", expanded=True):
+        st.write("**Head:**")
+        st.dataframe(make_arrow_safe(df.head()))
+
+        st.write("**Column types:**")
+        st.write(df.dtypes.astype(str))
+
+        st.write("**Summary statistics (numeric columns):**")
+        st.write(df.describe(include="number").T)
+
+    # --- Detect date column --- #
+    st.sidebar.header("Settings")
+
+    configured_date_col = st.sidebar.text_input("Specify date column (optional)", value="")
+    configured_date_col = configured_date_col or None
+
+    date_col = detect_date_column(df, configured_date_col)
+
+    if date_col:
+        st.sidebar.success(f"Using '{date_col}' as date column.")
+    else:
+        st.sidebar.info("No valid date column detected. Date filters disabled.")
+
+    # --- Axis & plot controls --- #
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    all_cols = df.columns.tolist()
+
+    col_x, col_y, col_type = st.columns(3)
 
     with col_x:
-        x_col = st.selectbox(
-            "X-axis column",
-            options=all_cols,
-            index=0 if default_x in all_cols else 0,
-            key="x_col_main",
-        )
-
-    possible_y = [c for c in all_cols if c != x_col]
-    if not possible_y:
-        st.warning("Need at least one column other than X to plot.")
-        return
-
-    default_y = possible_y[:1]
+        x_col = st.selectbox("X-axis column", options=all_cols)
 
     with col_y:
         y_cols = st.multiselect(
             "Y-axis column(s)",
-            options=possible_y,
-            default=default_y,
-            key="y_cols_main",
+            options=numeric_cols,
+            default=numeric_cols[:1],
+            help="Only numeric columns can be selected for Y.",
         )
+
+    with col_type:
+        plot_type = st.selectbox("Plot type", ["line", "scatter", "bar", "histogram"])
+
+    # --- Per-series style options (compact rows) --- #
+    series_styles = st.session_state["series_styles"]
+    active_styles = {}
+    if y_cols:
+        st.subheader("🎨 Style options per Y-column")
+        dash_map = {
+            "Solid": "solid",
+            "Dash": "dash",
+            "Dot": "dot",
+            "Dashdot": "dashdot",
+        }
+        label_map = {
+            "solid": "Solid",
+            "dash": "Dash",
+            "dot": "Dot",
+            "dashdot": "Dashdot",
+        }
+
+        for y in y_cols:
+            existing = series_styles.get(y, {})
+            default_color = existing.get("color", "#1f77b4")
+            default_width = existing.get("width", 2)
+            default_dash_value = existing.get("dash", "solid")
+            default_dash_label = label_map.get(default_dash_value, "Solid")
+
+            c1, c2, c3, c4 = st.columns([3, 2, 2, 3])
+            with c1:
+                st.markdown(f"**{y}**")
+            with c2:
+                color = st.color_picker(
+                    "Color",
+                    value=default_color,
+                    key=f"color_{y}",
+                    label_visibility="collapsed",
+                )
+            with c3:
+                width = st.number_input(
+                    "Width",
+                    min_value=1,
+                    max_value=8,
+                    value=default_width,
+                    step=1,
+                    key=f"width_{y}",
+                    label_visibility="collapsed",
+                )
+            with c4:
+                dash_label = st.selectbox(
+                    "Line type",
+                    options=list(dash_map.keys()),
+                    index=list(dash_map.keys()).index(default_dash_label),
+                    key=f"dash_{y}",
+                    label_visibility="collapsed",
+                )
+
+            series_styles[y] = {
+                "color": color,
+                "width": width,
+                "dash": dash_map[dash_label],
+            }
+            active_styles[y] = series_styles[y]
+
+    # --- Plot theme --- #
+    template = st.selectbox(
+        "Plotly theme",
+        ["plotly_white", "plotly_dark", "ggplot2", "seaborn", "simple_white"],
+        index=0,
+    )
+
+    # --- Date filters (if date column is present) --- #
+    df = parse_dates(df, date_col)
+    min_date, max_date = get_date_range(df, date_col)
+
+    start_date = None
+    end_date = None
+    year = None
+    month = None
+
+    if date_col and min_date is not None and max_date is not None:
+        st.sidebar.subheader("Date filtering")
+
+        use_date_range = st.sidebar.checkbox(
+            "Filter by date range", value=False
+        )
+
+        if use_date_range:
+            start_date_val = st.sidebar.date_input("Start date", value=min_date.date())
+            end_date_val = st.sidebar.date_input("End date", value=max_date.date())
+            start_date = pd.to_datetime(start_date_val)
+            end_date = pd.to_datetime(end_date_val)
+
+        use_year_month = st.sidebar.checkbox(
+            "Filter by year/month", value=False
+        )
+
+        if use_year_month:
+            years = sorted(df[date_col].dt.year.dropna().unique())
+            year = st.sidebar.selectbox("Year", options=[None] + list(years), index=0)
+
+            if year is not None:
+                months = sorted(
+                    df.loc[df[date_col].dt.year == year, date_col].dt.month.dropna().unique()
+                )
+                month = st.sidebar.selectbox(
+                    "Month", options=[None] + list(months), index=0
+                )
+
+    filtered_df = filter_by_date(df, date_col, start_date, end_date, year, month)
+
+    st.write(f"**Filtered data shape:** {filtered_df.shape[0]} rows × {filtered_df.shape[1]} columns")
+
+    # --- Plotting --- #
+    st.subheader("📈 Visualization")
 
     if not y_cols:
-        st.warning("Select at least one Y column.")
-        return
-
-    # ----------------------------------------------------------------
-    # Sidebar: plot parameters + per-Y styling (minimalistic)
-    # ----------------------------------------------------------------
-    st.sidebar.markdown("---")
-    st.sidebar.header("2. Plot configuration")
-
-    plot_type_label = st.sidebar.selectbox(
-        "Plot type",
-        options=["Line", "Line with markers", "Bar"],
-        index=0,
-    )
-    if plot_type_label == "Bar":
-        plot_type = "bar"
-    elif plot_type_label == "Line with markers":
-        plot_type = "scatter"
+        st.warning("Please select at least one numeric Y column.")
+        fig = None
     else:
-        plot_type = "line"
+        try:
+            if date_col and x_col == date_col and plot_type == "line":
+                fig = plot_time_series(
+                    filtered_df,
+                    date_col,
+                    y_cols,
+                    template=template,
+                    styles=active_styles,
+                )
+            else:
+                fig = make_figure(
+                    filtered_df,
+                    x_col,
+                    y_cols,
+                    plot_type,
+                    template=template,
+                    styles=active_styles,
+                )
 
-    template = st.sidebar.selectbox(
-        "Plot template",
-        options=["plotly_white", "plotly_dark", "simple_white", "ggplot2"],
-        index=0,
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error generating plot: {e}")
+            fig = None
+
+    # --- Save plots --- #
+    st.subheader("💾 Save plot configurations")
+
+    plot_label = st.text_input(
+        "Optional label for this plot",
+        value="",
+        help="Give this plot a short name (e.g. 'Winter 2020 hydrograph').",
     )
 
-    # Per-Y styling
-    st.sidebar.markdown("---")
-    st.sidebar.header("3. Style each Y")
-
-    dash_options = line_dash_options()
-    dash_labels = list(dash_options.keys())
-    color_palette = qualitative.Plotly
-
-    y_styles: Dict[str, Dict[str, Any]] = {}
-
-    for idx, y in enumerate(y_cols):
-        st.sidebar.markdown(f"**{y}**")
-        col_w, col_t, col_c = st.sidebar.columns([1, 1, 1])
-
-        with col_w:
-            width = st.number_input(
-                "Width",
-                min_value=1,
-                max_value=8,
-                value=2,
-                step=1,
-                key=f"{y}_width",
+    if st.button("Save current plot configuration") and fig is not None:
+        try:
+            label_value = plot_label.strip() or None
+            save_plot_config(
+                st.session_state["saved_plots"],
+                filtered_df,
+                x_col,
+                y_cols,
+                plot_type,
+                template,
+                label=label_value,
+                styles=active_styles,
             )
+            st.success("Plot configuration saved!")
+        except Exception as e:
+            st.error(f"Could not save plot configuration: {e}")
 
-        with col_t:
-            dash_label = st.selectbox(
-                "Type",
-                options=dash_labels,
-                index=0,
-                key=f"{y}_dash_style",
-            )
-            dash_value = dash_options[dash_label]
+    # --- Saved plots display (with delete option, guarded by try/except) --- #
+    if st.session_state["saved_plots"]:
+        st.subheader("🗂 Saved plots")
+        index_to_delete = None
 
-        with col_c:
-            default_color = color_palette[idx % len(color_palette)]
-            color = st.color_picker(
-                "Color",
-                value=default_color,
-                key=f"{y}_color",
-            )
+        for i, p in enumerate(st.session_state["saved_plots"], start=1):
+            desc = p.get("label") or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+            cols_header = st.columns([6, 1])
+            with cols_header[0]:
+                st.markdown(f"**Saved plot #{i}:** {desc}")
+            with cols_header[1]:
+                if st.button("Delete", key=f"delete_saved_{i}"):
+                    index_to_delete = i - 1
 
-        y_styles[y] = {"dash": dash_value, "width": width, "color": color}
+            styles_for_plot = p.get("styles")
+            try:
+                fig_saved = make_figure(
+                    p["data"],
+                    p["x_col"],
+                    p["y_cols"],
+                    p["plot_type"],
+                    template=p["template"],
+                    title=desc,
+                    styles=styles_for_plot,
+                )
+                st.plotly_chart(fig_saved, use_container_width=True, key=f"saved_plot_{i}")
+            except Exception as e:
+                st.error(f"Error displaying saved plot #{i}: {e}")
 
-    # ----------------------------------------------------------------
-    # MAIN AREA: current plot
-    # ----------------------------------------------------------------
-    st.markdown("---")
-    st.subheader("Current plot")
+        if index_to_delete is not None:
+            st.session_state["saved_plots"].pop(index_to_delete)
+            persist_saved_plots_to_disk(st.session_state["saved_plots"])
+            st.success("Plot configuration deleted.")
 
-    fig = build_single_plot_figure(
-        df=df,
-        x_col=x_col,
-        y_cols=y_cols,
-        plot_type=plot_type,
-        y_styles=y_styles,
-        template=template,
-    )
+    # --- Compare saved plots (read-only) --- #
+    if st.session_state["saved_plots"]:
+        st.subheader("🔍 Compare saved plots")
 
-    st.plotly_chart(fig, use_container_width=True)
+        saved = st.session_state["saved_plots"]
+        option_labels = []
+        index_by_label = {}
+        for i, p in enumerate(saved, start=1):
+            desc = p.get("label") or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+            label = f"#{i}: {desc}"
+            option_labels.append(label)
+            index_by_label[label] = i - 1
 
-    # ----------------------------------------------------------------
-    # Save plot configuration
-    # ----------------------------------------------------------------
-    st.markdown("---")
-    st.subheader("Saved plots")
-
-    col_save, col_clear = st.columns([1, 1])
-
-    with col_save:
-        if st.button("💾 Save current plot configuration"):
-            cfg = {
-                "data": df.copy(),  # snapshot of the data
-                "x_col": x_col,
-                "y_cols": y_cols.copy(),
-                "plot_type": plot_type,
-                "template": template,
-                "y_styles": y_styles,
-                "label": f"{', '.join(y_cols)} vs {x_col}",
-                "source_file": st.session_state["last_uploaded_name"],
-            }
-            st.session_state["saved_plots"].append(cfg)
-            st.success("Plot configuration saved.")
-
-    with col_clear:
-        if st.button("🗑️ Clear all saved plots"):
-            st.session_state["saved_plots"] = []
-            st.info("All saved plots removed.")
-
-    saved_plots: List[Dict[str, Any]] = st.session_state["saved_plots"]
-
-    if not saved_plots:
-        st.caption("No saved plots yet.")
-        return
-
-    for i, cfg in enumerate(saved_plots):
-        label = cfg.get("label", f"Plot {i + 1}")
-        source_file = cfg.get("source_file") or "unknown file"
-        st.write(
-            f"**#{i + 1}** – {label} "
-            f"(type: `{cfg.get('plot_type', 'line')}`, from `{source_file}`)"
+        selected_labels = st.multiselect(
+            "Select one or more saved plots to compare",
+            options=option_labels,
         )
+        selected_indices = [index_by_label[label] for label in selected_labels]
 
-    # ----------------------------------------------------------------
-    # Comparison selection + figure (with working sync)
-    # ----------------------------------------------------------------
-    st.markdown("---")
-    st.subheader("Compare saved plots")
+        sync_x = st.checkbox("Synchronize x-axis range", value=True)
 
-    indices = list(range(len(saved_plots)))
-    max_compare = 8
+        if len(selected_indices) == 0:
+            st.info("Select at least one plot above to show a comparison.")
 
-    selected_indices = st.multiselect(
-        f"Select plots to compare (up to {max_compare})",
-        options=indices,
-        default=indices[: min(len(indices), 2)],
-        format_func=lambda i: f"#{i + 1}: {saved_plots[i].get('label', f'Plot {i+1}')}",
-    )
+        elif len(selected_indices) == 1:
+            idx = selected_indices[0]
+            p = saved[idx]
+            desc = p.get("label") or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+            styles_for_plot = p.get("styles")
+            fig_cmp = make_figure(
+                p["data"],
+                p["x_col"],
+                p["y_cols"],
+                p["plot_type"],
+                template=p.get("template", "plotly_white"),
+                title=desc,
+                styles=styles_for_plot,
+            )
+            st.plotly_chart(fig_cmp, use_container_width=True, key=f"compare_{idx}")
 
-    if len(selected_indices) > max_compare:
-        st.warning(f"Please select at most {max_compare} plots.")
-        selected_indices = selected_indices[:max_compare]
+        elif len(selected_indices) == 2 and sync_x:
+            # Shared-x subplots (perfect sync when zooming)
+            idx1, idx2 = selected_indices
+            p1, p2 = saved[idx1], saved[idx2]
 
-    sync_x = st.checkbox(
-        "Synchronize x-axis across subplots (zoom one → zoom all)",
-        value=True,
-    )
+            desc1 = p1.get("label") or f"{', '.join(p1['y_cols'])} vs {p1['x_col']} ({p1['plot_type']})"
+            desc2 = p2.get("label") or f"{', '.join(p2['y_cols'])} vs {p2['x_col']} ({p2['plot_type']})"
 
-    if selected_indices:
-        compare_configs = [saved_plots[i] for i in selected_indices]
-        compare_fig = build_comparison_figure(compare_configs, sync_x=sync_x)
-        st.plotly_chart(compare_fig, use_container_width=True)
-    else:
-        st.caption("Select at least one saved plot to build a comparison.")
+            fig1 = make_figure(
+                p1["data"],
+                p1["x_col"],
+                p1["y_cols"],
+                p1["plot_type"],
+                template=p1.get("template", "plotly_white"),
+                title=desc1,
+                styles=p1.get("styles"),
+            )
+            fig2 = make_figure(
+                p2["data"],
+                p2["x_col"],
+                p2["y_cols"],
+                p2["plot_type"],
+                template=p2.get("template", "plotly_white"),
+                title=desc2,
+                styles=p2.get("styles"),
+            )
+
+            fig = make_subplots(
+                rows=2,
+                cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.07,
+                subplot_titles=(desc1, desc2),
+            )
+
+            for tr in fig1.data:
+                fig.add_trace(tr, row=1, col=1)
+            for tr in fig2.data:
+                fig.add_trace(tr, row=2, col=1)
+
+            fig.update_layout(
+                margin=dict(l=40, r=20, t=60, b=40),
+            )
+
+            st.plotly_chart(fig, use_container_width=True, key="compare_shared")
+
+        elif len(selected_indices) == 2 and not sync_x:
+            # Two independent stacked plots (no sync)
+            st.markdown("**Stacked comparison (two plots):**")
+            for idx in selected_indices:
+                p = saved[idx]
+                desc = p.get("label") or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+                styles_for_plot = p.get("styles")
+                fig_cmp = make_figure(
+                    p["data"],
+                    p["x_col"],
+                    p["y_cols"],
+                    p["plot_type"],
+                    template=p.get("template", "plotly_white"),
+                    title=desc,
+                    styles=styles_for_plot,
+                )
+                st.plotly_chart(fig_cmp, use_container_width=True, key=f"compare_{idx}")
+
+        else:
+            # 3 or more plots
+            if sync_x:
+                max_plots = len(selected_indices)
+                grid_cols = st.number_input(
+                    "Number of columns for comparison layout",
+                    min_value=1,
+                    max_value=max_plots,
+                    value=1,
+                    step=1,
+                    key="compare_cols_grid",
+                )
+                grid_rows = st.number_input(
+                    "Number of rows for comparison layout",
+                    min_value=1,
+                    max_value=max_plots,
+                    value=max_plots,
+                    step=1,
+                    key="compare_rows_grid",
+                )
+                total_cells = grid_rows * grid_cols
+                if total_cells < max_plots:
+                    st.warning(
+                        f"Grid has only {total_cells} cells, "
+                        f"so only the first {total_cells} selected plots will be shown."
+                    )
+
+                # Build per-subplot figures
+                subplot_titles = []
+                figs = []
+                usable_indices = selected_indices[:total_cells]
+                for idx in usable_indices:
+                    p = saved[idx]
+                    desc = p.get("label") or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+                    subplot_titles.append(desc)
+                    figs.append(
+                        make_figure(
+                            p["data"],
+                            p["x_col"],
+                            p["y_cols"],
+                            p["plot_type"],
+                            template=p.get("template", "plotly_white"),
+                            title=desc,
+                            styles=p.get("styles"),
+                        )
+                    )
+
+                # Pad titles to match rows*cols
+                while len(subplot_titles) < total_cells:
+                    subplot_titles.append("")
+
+                fig = make_subplots(
+                    rows=grid_rows,
+                    cols=grid_cols,
+                    shared_xaxes=True,
+                    vertical_spacing=0.05,
+                    subplot_titles=tuple(subplot_titles),
+                )
+
+                for k, f_sub in enumerate(figs):
+                    row = k // grid_cols + 1
+                    col = k % grid_cols + 1
+                    for tr in f_sub.data:
+                        fig.add_trace(tr, row=row, col=col)
+
+                # NEW FIX: link *all* x-axes to the main x-axis ("x")
+                xaxis_keys = [ax for ax in fig.layout if ax.startswith("xaxis")]
+                for ax in xaxis_keys:
+                    if ax == "xaxis":
+                        continue  # base axis
+                    fig.layout[ax].update(matches="x")
+
+                fig.update_layout(
+                    margin=dict(l=40, r=20, t=60, b=40),
+                )
+
+                st.plotly_chart(fig, use_container_width=True, key="compare_multi_shared")
+
+            else:
+                # Comparison grid; no sync
+                st.markdown("**Comparison grid:**")
+                cols_cmp = st.columns(2)
+                for j, idx in enumerate(selected_indices):
+                    p = saved[idx]
+                    desc = p.get("label") or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+                    styles_for_plot = p.get("styles")
+                    fig_cmp = make_figure(
+                        p["data"],
+                        p["x_col"],
+                        p["y_cols"],
+                        p["plot_type"],
+                        template=p.get("template", "plotly_white"),
+                        title=desc,
+                        styles=styles_for_plot,
+                    )
+                    col = cols_cmp[j % 2]
+                    col.plotly_chart(fig_cmp, use_container_width=True, key=f"compare_{idx}")
 
 
 if __name__ == "__main__":
