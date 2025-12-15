@@ -43,6 +43,25 @@ def detect_separator_from_sample(sample: str, decimal: str = ".") -> Optional[st
     return best_sep
 
 
+def apply_axis_titles(
+    fig,
+    title_y1: Optional[str] = None,
+    title_y2: Optional[str] = None,
+):
+    """Apply Y-axis titles safely (supports optional secondary axis)."""
+    updates = {}
+
+    if title_y1:
+        updates["yaxis"] = dict(title=title_y1)
+
+    if title_y2:
+        updates["yaxis2"] = dict(title=title_y2)
+
+    if updates:
+        fig.update_layout(**updates)
+
+
+
 def parse_dates_flexible(
     df: pd.DataFrame,
     date_col: Optional[str],
@@ -335,6 +354,8 @@ def plot_time_series(
     title: Optional[str] = None,
     styles: Optional[dict] = None,
     enable_secondary_axis: bool = False,
+    yaxis_title_1: Optional[str] = None,
+    yaxis_title_2: Optional[str] = None,
 ):
     """Create a time-series line chart with Plotly."""
     melted = df.melt(id_vars=date_col, value_vars=value_cols, var_name="variable", value_name="value")
@@ -358,6 +379,7 @@ def plot_time_series(
 
     apply_series_styles(fig, styles)
     apply_secondary_yaxis(fig, styles, enable_secondary=enable_secondary_axis)
+    apply_axis_titles(fig, yaxis_title_1, yaxis_title_2)
     return fig
 
 
@@ -370,6 +392,8 @@ def make_figure(
     title: Optional[str] = None,
     styles: Optional[dict] = None,
     enable_secondary_axis: bool = False,
+    yaxis_title_1: Optional[str] = None,
+    yaxis_title_2: Optional[str] = None,    
 ):
     """Create a Plotly figure based on the selected plot_type."""
     if not y_cols:
@@ -439,6 +463,8 @@ def make_figure(
 
     apply_series_styles(fig, styles)
     apply_secondary_yaxis(fig, styles, enable_secondary=enable_secondary_axis)
+    apply_axis_titles(fig, yaxis_title_1, yaxis_title_2)
+
     return fig
 
 
@@ -721,6 +747,23 @@ def main():
         }
 
         enable_secondary_axis = st.checkbox("Enable 2nd axis", value=False)
+        
+        st.sidebar.subheader("Axis titles")
+
+        yaxis_title_1 = st.sidebar.text_input(
+            "Primary Y-axis title",
+            value="",
+            help="Title for the left Y-axis",
+        )
+
+        yaxis_title_2 = None
+        if enable_secondary_axis:
+            yaxis_title_2 = st.sidebar.text_input(
+                "Secondary Y-axis title",
+                value="",
+                help="Title for the right Y-axis",
+            )
+
 
         if enable_secondary_axis and plot_type == "histogram":
             st.info("Secondary axis is disabled for histograms (uses Axis 1 only).")
@@ -854,6 +897,8 @@ def main():
                     template=template,
                     styles=active_styles,
                     enable_secondary_axis=enable_secondary_axis,
+                    yaxis_title_1=yaxis_title_1,
+                    yaxis_title_2=yaxis_title_2,   
                 )
             else:
                 fig = make_figure(
@@ -864,6 +909,8 @@ def main():
                     template=template,
                     styles=active_styles,
                     enable_secondary_axis=enable_secondary_axis,    
+                    yaxis_title_1=yaxis_title_1,
+                    yaxis_title_2=yaxis_title_2,   
                 )
 
             st.plotly_chart(fig, use_container_width=True)
