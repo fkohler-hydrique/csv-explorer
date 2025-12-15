@@ -1,4 +1,4 @@
-import io
+# import io
 import os
 import pickle
 from typing import List, Optional
@@ -41,6 +41,38 @@ def detect_separator_from_sample(sample: str, decimal: str = ".") -> Optional[st
             best_sep = sep
 
     return best_sep
+
+
+def parse_dates_flexible(
+    df: pd.DataFrame,
+    date_col: Optional[str],
+    dayfirst: bool = False,
+    date_format: Optional[str] = None,
+) -> pd.DataFrame:
+    """Parse dates with optional manual overrides."""
+    if date_col is None or date_col not in df.columns:
+        return df
+
+    df = df.copy()
+
+    try:
+        if date_format:
+            df[date_col] = pd.to_datetime(
+                df[date_col],
+                format=date_format,
+                errors="coerce",
+            )
+        else:
+            df[date_col] = pd.to_datetime(
+                df[date_col],
+                dayfirst=dayfirst,
+                # infer_datetime_format=True,
+                errors="coerce",
+            )
+    except Exception:
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+
+    return df
 
 
 def load_saved_plots_from_disk() -> List[dict]:
@@ -191,18 +223,98 @@ def get_date_range(df: pd.DataFrame, date_col: Optional[str]):
         return None, None
 
 
+def apply_secondary_yaxis(fig, styles: Optional[dict], enable_secondary: bool = False) -> None:
+    """Assign traces to y or y2 based on styles[*]['axis'] (1 or 2), robustly.
+
+    Handles cases where Plotly Express trace.name doesn't match the original column name,
+    especially for single-series plots.
+    """
+    if not enable_secondary or not styles:
+        return
+
+    any_on_y2 = False
+
+    # Helper: decide which style key applies to a trace
+    def _style_key_for_trace(trace):
+        name = getattr(trace, "name", None)
+
+        # Direct match (most multi-series cases)
+        if name and name in styles:
+            return name
+
+        # Try legendgroup as fallback
+        lg = getattr(trace, "legendgroup", None)
+        if lg and lg in styles:
+            return lg
+
+        # If there is only one style entry and one trace, assume they correspond
+        if len(styles) == 1 and len(fig.data) == 1:
+            return next(iter(styles.keys()))
+
+        return None
+
+    for trace in fig.data:
+        key = _style_key_for_trace(trace)
+        axis = 1
+        if key is not None:
+            axis = (styles.get(key, {}) or {}).get("axis", 1)
+
+        if axis == 2:
+            trace.update(yaxis="y2")
+            any_on_y2 = True
+        else:
+            trace.update(yaxis="y")
+
+    if any_on_y2:
+        # Make sure the right axis is actually visible and has room
+        current_margin = fig.layout.margin.to_plotly_json() if fig.layout.margin else {}
+        r = current_margin.get("r", 20)
+        fig.update_layout(
+            margin=dict(
+                l=current_margin.get("l", 40),
+                r=max(r, 70),   # <-- important: room for right ticks/labels
+                t=current_margin.get("t", 40),
+                b=current_margin.get("b", 40),
+            ),
+            yaxis2=dict(
+                overlaying="y",
+                side="right",
+                autorange=True,
+                showgrid=False,
+                zeroline=False,
+                showline=True,
+                ticks="outside",
+                showticklabels=True,
+                title=dict(text=""),  # keep empty unless you later add a UI label
+            ),
+        )
+
+
 def apply_series_styles(fig, styles: Optional[dict]) -> None:
     """Apply per-series style (color, width, dash) to a Plotly figure."""
     if not styles:
         return
 
-    for trace in fig.data:
+    def _style_key_for_trace(trace):
         name = getattr(trace, "name", None)
-        if not name:
+        if name and name in styles:
+            return name
+
+        lg = getattr(trace, "legendgroup", None)
+        if lg and lg in styles:
+            return lg
+
+        if len(styles) == 1 and len(fig.data) == 1:
+            return next(iter(styles.keys()))
+
+        return None
+
+    for trace in fig.data:
+        key = _style_key_for_trace(trace)
+        if key is None:
             continue
-        s = styles.get(name)
-        if not s:
-            continue
+
+        s = styles.get(key) or {}
         line_kwargs = {}
         if s.get("color"):
             line_kwargs["color"] = s["color"]
@@ -210,6 +322,7 @@ def apply_series_styles(fig, styles: Optional[dict]) -> None:
             line_kwargs["width"] = s["width"]
         if s.get("dash"):
             line_kwargs["dash"] = s["dash"]
+
         if line_kwargs:
             trace.update(line=line_kwargs)
 
@@ -221,6 +334,7 @@ def plot_time_series(
     template: str = "plotly_white",
     title: Optional[str] = None,
     styles: Optional[dict] = None,
+    enable_secondary_axis: bool = False,
 ):
     """Create a time-series line chart with Plotly."""
     melted = df.melt(id_vars=date_col, value_vars=value_cols, var_name="variable", value_name="value")
@@ -243,6 +357,7 @@ def plot_time_series(
     fig.update_yaxes(showgrid=True, zeroline=False)
 
     apply_series_styles(fig, styles)
+    apply_secondary_yaxis(fig, styles, enable_secondary=enable_secondary_axis)
     return fig
 
 
@@ -254,6 +369,7 @@ def make_figure(
     template: str = "plotly_white",
     title: Optional[str] = None,
     styles: Optional[dict] = None,
+    enable_secondary_axis: bool = False,
 ):
     """Create a Plotly figure based on the selected plot_type."""
     if not y_cols:
@@ -322,6 +438,7 @@ def make_figure(
     fig.update_yaxes(showgrid=True, zeroline=False)
 
     apply_series_styles(fig, styles)
+    apply_secondary_yaxis(fig, styles, enable_secondary=enable_secondary_axis)
     return fig
 
 
@@ -543,6 +660,26 @@ def main():
     else:
         st.sidebar.info("No valid date column detected. Date filters disabled.")
 
+    # --- Date parsing options (sidebar) --- #
+    dayfirst = False
+    date_format = None
+
+    if date_col:
+        st.sidebar.subheader("Date parsing")
+
+        dayfirst = st.sidebar.checkbox(
+            "Day first (DD/MM instead of MM/DD)",
+            value=False,
+            help="Enable this if day and month seem inverted",
+        )
+
+        date_format = st.sidebar.text_input(
+            "Explicit date format (optional)",
+            value="",
+            help="Example: %d/%m/%Y, %Y-%m-%d, %d.%m.%Y",
+        )
+        date_format = date_format.strip() or None
+
     # --- Axis & plot controls --- #
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
     all_cols = df.columns.tolist()
@@ -566,6 +703,8 @@ def main():
     # --- Per-series style options (compact rows) --- #
     series_styles = st.session_state["series_styles"]
     active_styles = {}
+    enable_secondary_axis = False
+
     if y_cols:
         st.subheader("🎨 Style options per Y-column")
         dash_map = {
@@ -581,6 +720,11 @@ def main():
             "dashdot": "Dashdot",
         }
 
+        enable_secondary_axis = st.checkbox("Enable 2nd axis", value=False)
+
+        if enable_secondary_axis and plot_type == "histogram":
+            st.info("Secondary axis is disabled for histograms (uses Axis 1 only).")
+
         for y in y_cols:
             existing = series_styles.get(y, {})
             default_color = existing.get("color", "#1f77b4")
@@ -588,7 +732,8 @@ def main():
             default_dash_value = existing.get("dash", "solid")
             default_dash_label = label_map.get(default_dash_value, "Solid")
 
-            c1, c2, c3, c4 = st.columns([3, 2, 2, 3])
+            c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 3, 2])
+
             with c1:
                 st.markdown(f"**{y}**")
             with c2:
@@ -617,10 +762,25 @@ def main():
                     label_visibility="collapsed",
                 )
 
+            axis_value = (existing.get("axis", 1) if isinstance(existing, dict) else 1)
+
+            with c5:
+                if enable_secondary_axis and plot_type != "histogram":
+                    axis_choice = st.selectbox(
+                        "Axis",
+                        options=[1, 2],
+                        index=0 if axis_value == 1 else 1,
+                        key=f"axis_{y}",
+                        label_visibility="collapsed",
+                    )
+                else:
+                    axis_choice = 1
+
             series_styles[y] = {
                 "color": color,
                 "width": width,
                 "dash": dash_map[dash_label],
+                "axis": axis_choice,
             }
             active_styles[y] = series_styles[y]
 
@@ -632,7 +792,12 @@ def main():
     )
 
     # --- Date filters (if date column is present) --- #
-    df = parse_dates(df, date_col)
+    df = parse_dates_flexible(
+        df,
+        date_col,
+        dayfirst=dayfirst,
+        date_format=date_format,
+    )
     min_date, max_date = get_date_range(df, date_col)
 
     start_date = None
@@ -688,6 +853,7 @@ def main():
                     y_cols,
                     template=template,
                     styles=active_styles,
+                    enable_secondary_axis=enable_secondary_axis,
                 )
             else:
                 fig = make_figure(
@@ -697,6 +863,7 @@ def main():
                     plot_type,
                     template=template,
                     styles=active_styles,
+                    enable_secondary_axis=enable_secondary_axis,    
                 )
 
             st.plotly_chart(fig, use_container_width=True)
@@ -754,6 +921,7 @@ def main():
                     template=p["template"],
                     title=desc,
                     styles=styles_for_plot,
+                    enable_secondary_axis=True,
                 )
                 st.plotly_chart(fig_saved, use_container_width=True, key=f"saved_plot_{i}")
             except Exception as e:
@@ -801,6 +969,7 @@ def main():
                 template=p.get("template", "plotly_white"),
                 title=desc,
                 styles=styles_for_plot,
+                enable_secondary_axis=True,
             )
             st.plotly_chart(fig_cmp, use_container_width=True, key=f"compare_{idx}")
 
@@ -820,6 +989,7 @@ def main():
                 template=p1.get("template", "plotly_white"),
                 title=desc1,
                 styles=p1.get("styles"),
+                enable_secondary_axis=True,
             )
             fig2 = make_figure(
                 p2["data"],
@@ -829,6 +999,7 @@ def main():
                 template=p2.get("template", "plotly_white"),
                 title=desc2,
                 styles=p2.get("styles"),
+                enable_secondary_axis=True,
             )
 
             fig = make_subplots(
@@ -865,6 +1036,7 @@ def main():
                     template=p.get("template", "plotly_white"),
                     title=desc,
                     styles=styles_for_plot,
+                    enable_secondary_axis=True,
                 )
                 st.plotly_chart(fig_cmp, use_container_width=True, key=f"compare_{idx}")
 
@@ -912,6 +1084,7 @@ def main():
                             template=p.get("template", "plotly_white"),
                             title=desc,
                             styles=p.get("styles"),
+                            enable_secondary_axis=True,
                         )
                     )
 
@@ -962,6 +1135,7 @@ def main():
                         template=p.get("template", "plotly_white"),
                         title=desc,
                         styles=styles_for_plot,
+                        enable_secondary_axis=True,
                     )
                     col = cols_cmp[j % 2]
                     col.plotly_chart(fig_cmp, use_container_width=True, key=f"compare_{idx}")
