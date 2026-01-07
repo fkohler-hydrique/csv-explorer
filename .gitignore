@@ -18,3 +18,9 @@ Thumbs.db
 .vscode/
 *.log
 .deps_installed
+
+# personalized files
+*.pkl
+*.json
+*_bk.py
+*copy.py

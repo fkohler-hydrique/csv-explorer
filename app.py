@@ -1,6 +1,10 @@
 # import io
 import os
 import pickle
+import json
+import uuid
+import datetime
+import difflib
 from typing import List, Optional
 
 import pandas as pd
@@ -14,6 +18,7 @@ from plotly.subplots import make_subplots
 CANDIDATE_SEPARATORS = [",", ";", "\t", "|"]
 DATE_KEYWORDS = ("date", "time", "datum", "zeit", "datetime")
 SAVED_PLOTS_FILE = "saved_plots.pkl"
+SAVED_CONFIGS_FILE = "saved_configs.json"
 
 
 def detect_separator_from_sample(sample: str, decimal: str = ".") -> Optional[str]:
@@ -59,7 +64,6 @@ def apply_axis_titles(
 
     if updates:
         fig.update_layout(**updates)
-
 
 
 def parse_dates_flexible(
@@ -119,6 +123,7 @@ def persist_saved_plots_to_disk(saved_plots: List[dict]) -> None:
 
 # ------------- Utility functions ------------- #
 
+
 def load_csv(
     file_or_path,
     sep: Optional[str] = None,
@@ -173,7 +178,9 @@ def make_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
     return safe
 
 
-def detect_date_column(df: pd.DataFrame, configured: Optional[str] = None) -> Optional[str]:
+def detect_date_column(
+    df: pd.DataFrame, configured: Optional[str] = None
+) -> Optional[str]:
     """Try to detect a date/time column; prefer configured name if present."""
     date_col = configured if configured in df.columns else None
 
@@ -242,7 +249,9 @@ def get_date_range(df: pd.DataFrame, date_col: Optional[str]):
         return None, None
 
 
-def apply_secondary_yaxis(fig, styles: Optional[dict], enable_secondary: bool = False) -> None:
+def apply_secondary_yaxis(
+    fig, styles: Optional[dict], enable_secondary: bool = False
+) -> None:
     """Assign traces to y or y2 based on styles[*]['axis'] (1 or 2), robustly.
 
     Handles cases where Plotly Express trace.name doesn't match the original column name,
@@ -291,7 +300,7 @@ def apply_secondary_yaxis(fig, styles: Optional[dict], enable_secondary: bool = 
         fig.update_layout(
             margin=dict(
                 l=current_margin.get("l", 40),
-                r=max(r, 70),   # <-- important: room for right ticks/labels
+                r=max(r, 70),  # <-- important: room for right ticks/labels
                 t=current_margin.get("t", 40),
                 b=current_margin.get("b", 40),
             ),
@@ -358,7 +367,9 @@ def plot_time_series(
     yaxis_title_2: Optional[str] = None,
 ):
     """Create a time-series line chart with Plotly."""
-    melted = df.melt(id_vars=date_col, value_vars=value_cols, var_name="variable", value_name="value")
+    melted = df.melt(
+        id_vars=date_col, value_vars=value_cols, var_name="variable", value_name="value"
+    )
     fig = px.line(
         melted,
         x=date_col,
@@ -393,7 +404,7 @@ def make_figure(
     styles: Optional[dict] = None,
     enable_secondary_axis: bool = False,
     yaxis_title_1: Optional[str] = None,
-    yaxis_title_2: Optional[str] = None,    
+    yaxis_title_2: Optional[str] = None,
 ):
     """Create a Plotly figure based on the selected plot_type."""
     if not y_cols:
@@ -530,6 +541,7 @@ def compute_global_x_range(saved_plots: List[dict], indices: List[int]):
 
 # ------------- Main app ------------- #
 
+
 def main():
     st.set_page_config(
         page_title="Interactive CSV Explorer",
@@ -546,7 +558,78 @@ def main():
         st.session_state["saved_plots"] = load_saved_plots_from_disk()
     if "series_styles" not in st.session_state:
         st.session_state["series_styles"] = {}
+    if "saved_configs" not in st.session_state:
+        st.session_state["saved_configs"] = load_saved_configs_from_disk()
+    if "active_config_id" not in st.session_state:
+        st.session_state["active_config_id"] = None
 
+    # --- Dashboard configs (templates) --- #
+    config_ui = st.container()
+    dashboard_placeholder = st.empty()
+
+    with config_ui:
+        st.subheader("🧩 Dashboard configs")
+        saved_configs = st.session_state["saved_configs"]
+
+        # Selector
+        options = [("(none)", None)] + [
+            (c.get("name", f"Config {i + 1}"), c.get("id"))
+            for i, c in enumerate(saved_configs)
+        ]
+        active_id = st.session_state.get("active_config_id")
+
+        # Determine current selection index
+        idx = 0
+        if active_id is not None:
+            for j, (_, cid) in enumerate(options):
+                if cid == active_id:
+                    idx = j
+                    break
+
+        label_list = [o[0] for o in options]
+        selected_label = st.selectbox("Select a dashboard", label_list, index=idx)
+        selected_id = None
+        for lbl, cid in options:
+            if lbl == selected_label:
+                selected_id = cid
+                break
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("Activate selected dashboard", disabled=(selected_id is None)):
+                st.session_state["active_config_id"] = selected_id
+                st.success("Dashboard activated.")
+        with col_b:
+            if st.button(
+                "Clear active dashboard",
+                disabled=(st.session_state.get("active_config_id") is None),
+            ):
+                st.session_state["active_config_id"] = None
+                st.info("Active dashboard cleared.")
+
+        with st.expander("Manage saved dashboards", expanded=False):
+            if not saved_configs:
+                st.caption("No saved dashboards yet.")
+            else:
+                for i, c in enumerate(list(saved_configs)):
+                    c_name = c.get("name", f"Dashboard {i + 1}")
+                    cols = st.columns([6, 2])
+                    cols[0].markdown(
+                        f"**{c_name}**  \n{len(c.get('plots') or [])} plot(s)"
+                    )
+                    if cols[1].button(
+                        "Delete", key=f"delete_dashboard_{c.get('id', i)}"
+                    ):
+                        # Remove from list, persist, and clear if active
+                        cid = c.get("id")
+                        st.session_state["saved_configs"] = [
+                            x for x in saved_configs if x.get("id") != cid
+                        ]
+                        if st.session_state.get("active_config_id") == cid:
+                            st.session_state["active_config_id"] = None
+                        persist_saved_configs_to_disk(st.session_state["saved_configs"])
+                        st.success("Dashboard deleted.")
+                        st.rerun()
     # --- File input section --- #
     col_file, col_path = st.columns(2)
 
@@ -676,7 +759,9 @@ def main():
     # --- Detect date column --- #
     st.sidebar.header("Settings")
 
-    configured_date_col = st.sidebar.text_input("Specify date column (optional)", value="")
+    configured_date_col = st.sidebar.text_input(
+        "Specify date column (optional)", value=""
+    )
     configured_date_col = configured_date_col or None
 
     date_col = detect_date_column(df, configured_date_col)
@@ -747,7 +832,7 @@ def main():
         }
 
         enable_secondary_axis = st.checkbox("Enable 2nd axis", value=False)
-        
+
         st.sidebar.subheader("Axis titles")
 
         yaxis_title_1 = st.sidebar.text_input(
@@ -763,7 +848,6 @@ def main():
                 value="",
                 help="Title for the right Y-axis",
             )
-
 
         if enable_secondary_axis and plot_type == "histogram":
             st.info("Secondary axis is disabled for histograms (uses Axis 1 only).")
@@ -805,7 +889,7 @@ def main():
                     label_visibility="collapsed",
                 )
 
-            axis_value = (existing.get("axis", 1) if isinstance(existing, dict) else 1)
+            axis_value = existing.get("axis", 1) if isinstance(existing, dict) else 1
 
             with c5:
                 if enable_secondary_axis and plot_type != "histogram":
@@ -851,9 +935,7 @@ def main():
     if date_col and min_date is not None and max_date is not None:
         st.sidebar.subheader("Date filtering")
 
-        use_date_range = st.sidebar.checkbox(
-            "Filter by date range", value=False
-        )
+        use_date_range = st.sidebar.checkbox("Filter by date range", value=False)
 
         if use_date_range:
             start_date_val = st.sidebar.date_input("Start date", value=min_date.date())
@@ -861,9 +943,7 @@ def main():
             start_date = pd.to_datetime(start_date_val)
             end_date = pd.to_datetime(end_date_val)
 
-        use_year_month = st.sidebar.checkbox(
-            "Filter by year/month", value=False
-        )
+        use_year_month = st.sidebar.checkbox("Filter by year/month", value=False)
 
         if use_year_month:
             years = sorted(df[date_col].dt.year.dropna().unique())
@@ -871,7 +951,9 @@ def main():
 
             if year is not None:
                 months = sorted(
-                    df.loc[df[date_col].dt.year == year, date_col].dt.month.dropna().unique()
+                    df.loc[df[date_col].dt.year == year, date_col]
+                    .dt.month.dropna()
+                    .unique()
                 )
                 month = st.sidebar.selectbox(
                     "Month", options=[None] + list(months), index=0
@@ -879,7 +961,26 @@ def main():
 
     filtered_df = filter_by_date(df, date_col, start_date, end_date, year, month)
 
-    st.write(f"**Filtered data shape:** {filtered_df.shape[0]} rows × {filtered_df.shape[1]} columns")
+    # --- Render active dashboard at the top (if any) --- #
+    active_id = st.session_state.get("active_config_id")
+    active_cfg = None
+    if active_id is not None:
+        for c in st.session_state.get("saved_configs", []):
+            if c.get("id") == active_id:
+                active_cfg = c
+                break
+
+    with dashboard_placeholder.container():
+        if active_cfg is None:
+            st.info(
+                "No active dashboard selected. Select one above to render your saved plots configuration."
+            )
+        else:
+            render_active_dashboard(filtered_df, active_cfg)
+
+    st.write(
+        f"**Filtered data shape:** {filtered_df.shape[0]} rows × {filtered_df.shape[1]} columns"
+    )
 
     # --- Plotting --- #
     st.subheader("📈 Visualization")
@@ -898,7 +999,7 @@ def main():
                     styles=active_styles,
                     enable_secondary_axis=enable_secondary_axis,
                     yaxis_title_1=yaxis_title_1,
-                    yaxis_title_2=yaxis_title_2,   
+                    yaxis_title_2=yaxis_title_2,
                 )
             else:
                 fig = make_figure(
@@ -908,9 +1009,9 @@ def main():
                     plot_type,
                     template=template,
                     styles=active_styles,
-                    enable_secondary_axis=enable_secondary_axis,    
+                    enable_secondary_axis=enable_secondary_axis,
                     yaxis_title_1=yaxis_title_1,
-                    yaxis_title_2=yaxis_title_2,   
+                    yaxis_title_2=yaxis_title_2,
                 )
 
             st.plotly_chart(fig, use_container_width=True)
@@ -927,7 +1028,86 @@ def main():
         help="Give this plot a short name (e.g. 'Winter 2020 hydrograph').",
     )
 
-    if st.button("Save current plot configuration") and fig is not None:
+    # --- Save dashboard config (template) --- #
+    st.markdown(
+        "**Dashboard templates (configs)** are saved separately in `saved_configs.json` and re-render on the current CSV."
+    )
+    dashboard_name = st.text_input(
+        "Dashboard name (for templates)",
+        value="",
+        help="This name identifies the dashboard template you can load later (can contain 1 or multiple plots).",
+        key="dashboard_name_input",
+    )
+
+    col_cfg1, col_cfg2 = st.columns(2)
+    with col_cfg1:
+        if st.button("Save current plot as dashboard template", disabled=(fig is None)):
+            if not dashboard_name.strip():
+                st.warning("Please provide a dashboard name.")
+            else:
+                new_cfg = {
+                    "id": str(uuid.uuid4()),
+                    "name": dashboard_name.strip(),
+                    "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+                    "plots": [
+                        build_plot_spec_from_current(
+                            x_col=x_col,
+                            y_cols=y_cols,
+                            plot_type=plot_type,
+                            template=template,
+                            styles=active_styles,
+                            enable_secondary_axis=enable_secondary_axis,
+                            yaxis_title_1=yaxis_title_1,
+                            yaxis_title_2=yaxis_title_2,
+                            title=plot_label.strip() or None,
+                        )
+                    ],
+                }
+                st.session_state["saved_configs"].append(new_cfg)
+                persist_saved_configs_to_disk(st.session_state["saved_configs"])
+                st.success("Dashboard template saved.")
+    with col_cfg2:
+        with st.expander(
+            "Create multi-plot dashboard from saved snapshots", expanded=False
+        ):
+            saved_plots = st.session_state.get("saved_plots", [])
+            if not saved_plots:
+                st.caption("No saved plots available yet.")
+            else:
+                labels = []
+                for i, p in enumerate(saved_plots):
+                    lbl = p.get("label") or f"Saved plot {i + 1}"
+                    labels.append(f"{i + 1}. {lbl}")
+                selected = st.multiselect("Select saved plots to include", labels)
+                if st.button("Create dashboard from selected saved plots"):
+                    if not dashboard_name.strip():
+                        st.warning("Please provide a dashboard name above.")
+                    elif not selected:
+                        st.warning("Select at least one saved plot.")
+                    else:
+                        idxs = []
+                        for s in selected:
+                            try:
+                                idxs.append(int(s.split(".", 1)[0]) - 1)
+                            except Exception:
+                                pass
+                        plot_specs = []
+                        for i in idxs:
+                            if 0 <= i < len(saved_plots):
+                                plot_specs.append(
+                                    build_plot_spec_from_saved_plot(saved_plots[i])
+                                )
+                        new_cfg = {
+                            "id": str(uuid.uuid4()),
+                            "name": dashboard_name.strip(),
+                            "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+                            "plots": plot_specs,
+                        }
+                        st.session_state["saved_configs"].append(new_cfg)
+                        persist_saved_configs_to_disk(st.session_state["saved_configs"])
+                        st.success("Dashboard template saved from selected plots.")
+
+    if st.button("Save current plot") and fig is not None:
         try:
             label_value = plot_label.strip() or None
             save_plot_config(
@@ -950,7 +1130,10 @@ def main():
         index_to_delete = None
 
         for i, p in enumerate(st.session_state["saved_plots"], start=1):
-            desc = p.get("label") or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+            desc = (
+                p.get("label")
+                or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+            )
             cols_header = st.columns([6, 1])
             with cols_header[0]:
                 st.markdown(f"**Saved plot #{i}:** {desc}")
@@ -970,7 +1153,9 @@ def main():
                     styles=styles_for_plot,
                     enable_secondary_axis=True,
                 )
-                st.plotly_chart(fig_saved, use_container_width=True, key=f"saved_plot_{i}")
+                st.plotly_chart(
+                    fig_saved, use_container_width=True, key=f"saved_plot_{i}"
+                )
             except Exception as e:
                 st.error(f"Error displaying saved plot #{i}: {e}")
 
@@ -987,7 +1172,10 @@ def main():
         option_labels = []
         index_by_label = {}
         for i, p in enumerate(saved, start=1):
-            desc = p.get("label") or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+            desc = (
+                p.get("label")
+                or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+            )
             label = f"#{i}: {desc}"
             option_labels.append(label)
             index_by_label[label] = i - 1
@@ -1006,7 +1194,10 @@ def main():
         elif len(selected_indices) == 1:
             idx = selected_indices[0]
             p = saved[idx]
-            desc = p.get("label") or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+            desc = (
+                p.get("label")
+                or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+            )
             styles_for_plot = p.get("styles")
             fig_cmp = make_figure(
                 p["data"],
@@ -1025,8 +1216,14 @@ def main():
             idx1, idx2 = selected_indices
             p1, p2 = saved[idx1], saved[idx2]
 
-            desc1 = p1.get("label") or f"{', '.join(p1['y_cols'])} vs {p1['x_col']} ({p1['plot_type']})"
-            desc2 = p2.get("label") or f"{', '.join(p2['y_cols'])} vs {p2['x_col']} ({p2['plot_type']})"
+            desc1 = (
+                p1.get("label")
+                or f"{', '.join(p1['y_cols'])} vs {p1['x_col']} ({p1['plot_type']})"
+            )
+            desc2 = (
+                p2.get("label")
+                or f"{', '.join(p2['y_cols'])} vs {p2['x_col']} ({p2['plot_type']})"
+            )
 
             fig1 = make_figure(
                 p1["data"],
@@ -1073,7 +1270,10 @@ def main():
             st.markdown("**Stacked comparison (two plots):**")
             for idx in selected_indices:
                 p = saved[idx]
-                desc = p.get("label") or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+                desc = (
+                    p.get("label")
+                    or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+                )
                 styles_for_plot = p.get("styles")
                 fig_cmp = make_figure(
                     p["data"],
@@ -1120,7 +1320,10 @@ def main():
                 usable_indices = selected_indices[:total_cells]
                 for idx in usable_indices:
                     p = saved[idx]
-                    desc = p.get("label") or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+                    desc = (
+                        p.get("label")
+                        or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+                    )
                     subplot_titles.append(desc)
                     figs.append(
                         make_figure(
@@ -1164,7 +1367,9 @@ def main():
                     margin=dict(l=40, r=20, t=60, b=40),
                 )
 
-                st.plotly_chart(fig, use_container_width=True, key="compare_multi_shared")
+                st.plotly_chart(
+                    fig, use_container_width=True, key="compare_multi_shared"
+                )
 
             else:
                 # Comparison grid; no sync
@@ -1172,7 +1377,10 @@ def main():
                 cols_cmp = st.columns(2)
                 for j, idx in enumerate(selected_indices):
                     p = saved[idx]
-                    desc = p.get("label") or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+                    desc = (
+                        p.get("label")
+                        or f"{', '.join(p['y_cols'])} vs {p['x_col']} ({p['plot_type']})"
+                    )
                     styles_for_plot = p.get("styles")
                     fig_cmp = make_figure(
                         p["data"],
@@ -1185,7 +1393,205 @@ def main():
                         enable_secondary_axis=True,
                     )
                     col = cols_cmp[j % 2]
-                    col.plotly_chart(fig_cmp, use_container_width=True, key=f"compare_{idx}")
+                    col.plotly_chart(
+                        fig_cmp, use_container_width=True, key=f"compare_{idx}"
+                    )
+
+
+def load_saved_configs_from_disk() -> List[dict]:
+    """Load saved dashboard configs (templates) from disk if available."""
+    if not os.path.exists(SAVED_CONFIGS_FILE):
+        return []
+    try:
+        with open(SAVED_CONFIGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [c for c in data if isinstance(c, dict)]
+    except Exception:
+        pass
+    return []
+
+
+def persist_saved_configs_to_disk(saved_configs: List[dict]) -> None:
+    """Persist saved dashboard configs to disk (best-effort)."""
+    try:
+        with open(SAVED_CONFIGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(saved_configs, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _normalize_colname(name: str) -> str:
+    """Normalize column names for robust matching across CSV versions."""
+    if name is None:
+        return ""
+    s = str(name).strip().lower()
+    s = s.replace("-", " ").replace("_", " ")
+    s = " ".join(s.split())
+    return s
+
+
+def resolve_column(requested: str, available_cols: List[str]) -> Optional[str]:
+    """Resolve a requested column name to an existing column in available_cols.
+
+    Strategy:
+      1) exact match
+      2) normalized match (case/whitespace/_/-)
+      3) fuzzy match (difflib) on normalized strings
+    """
+    if not requested:
+        return None
+    if requested in available_cols:
+        return requested
+
+    norm_to_actual = {_normalize_colname(c): c for c in available_cols}
+    req_norm = _normalize_colname(requested)
+
+    if req_norm in norm_to_actual:
+        return norm_to_actual[req_norm]
+
+    # Fuzzy match
+    candidates = difflib.get_close_matches(
+        req_norm, list(norm_to_actual.keys()), n=1, cutoff=0.80
+    )
+    if candidates:
+        return norm_to_actual[candidates[0]]
+
+    return None
+
+
+def build_plot_spec_from_current(
+    x_col: str,
+    y_cols: List[str],
+    plot_type: str,
+    template: str,
+    styles: Optional[dict],
+    enable_secondary_axis: bool,
+    yaxis_title_1: Optional[str],
+    yaxis_title_2: Optional[str],
+    title: Optional[str] = None,
+) -> dict:
+    """Create a config plot spec from the current interactive builder state."""
+    styles_for_plot = None
+    if styles:
+        styles_for_plot = {k: v for k, v in styles.items() if k in (y_cols or [])}
+
+    return {
+        "x_col": x_col,
+        "y_cols": list(y_cols or []),
+        "plot_type": plot_type,
+        "template": template,
+        "title": title,
+        "styles": styles_for_plot,
+        "enable_secondary_axis": bool(enable_secondary_axis),
+        "yaxis_title_1": yaxis_title_1,
+        "yaxis_title_2": yaxis_title_2,
+    }
+
+
+def build_plot_spec_from_saved_plot(saved_plot: dict) -> dict:
+    """Create a config plot spec from an existing saved plot snapshot entry."""
+    return {
+        "x_col": saved_plot.get("x_col"),
+        "y_cols": list(saved_plot.get("y_cols") or []),
+        "plot_type": saved_plot.get("plot_type", "line"),
+        "template": saved_plot.get("template", "plotly_white"),
+        "title": saved_plot.get("label") or None,
+        "styles": saved_plot.get("styles"),
+        "enable_secondary_axis": False,
+        "yaxis_title_1": None,
+        "yaxis_title_2": None,
+    }
+
+
+def resolve_plot_spec_against_df(
+    plot_spec: dict, df: pd.DataFrame
+) -> tuple[Optional[dict], List[str]]:
+    """Resolve plot_spec column bindings against df columns.
+
+    Returns: (resolved_spec or None if not plottable, missing_names)
+    """
+    available = list(df.columns)
+
+    x_req = plot_spec.get("x_col")
+    x_res = resolve_column(x_req, available) if x_req else None
+    if x_res is None:
+        # Without a valid X, we cannot reliably plot this spec.
+        return None, [str(x_req)] if x_req else ["<missing x_col>"]
+
+    y_reqs = list(plot_spec.get("y_cols") or [])
+    y_resolved = []
+    missing = []
+    for y in y_reqs:
+        y_res = resolve_column(y, available)
+        if y_res is None:
+            missing.append(str(y))
+        else:
+            y_resolved.append(y_res)
+
+    if not y_resolved:
+        # If no Y series can be resolved, don't render the plot.
+        return None, missing
+
+    # Remap styles, if present
+    styles = plot_spec.get("styles") or None
+    remapped_styles = None
+    if isinstance(styles, dict):
+        remapped_styles = {}
+        for orig_y, style in styles.items():
+            new_y = resolve_column(orig_y, available)
+            if new_y is not None:
+                remapped_styles[new_y] = style
+
+    resolved = dict(plot_spec)
+    resolved["x_col"] = x_res
+    resolved["y_cols"] = y_resolved
+    resolved["styles"] = remapped_styles
+
+    return resolved, missing
+
+
+def render_active_dashboard(df: pd.DataFrame, config: dict) -> None:
+    """Render an active dashboard (one or more plots) using the current df."""
+    plots = list(config.get("plots") or [])
+    if not plots:
+        st.info("This dashboard has no plots.")
+        return
+
+    st.subheader(f"📌 Active dashboard: {config.get('name', 'Unnamed')}")
+    for i, spec in enumerate(plots, start=1):
+        resolved_spec, missing = resolve_plot_spec_against_df(spec, df)
+        if resolved_spec is None:
+            # Not plottable (missing X or no Y resolved)
+            if missing:
+                st.warning(
+                    f"Plot {i}: could not be rendered (missing/unmatched: {', '.join(missing)})."
+                )
+            else:
+                st.warning(f"Plot {i}: could not be rendered.")
+            continue
+
+        if missing:
+            st.warning(
+                f"Plot {i}: some series were not found and were skipped: {', '.join(missing)}"
+            )
+
+        try:
+            fig = make_figure(
+                df,
+                resolved_spec["x_col"],
+                resolved_spec["y_cols"],
+                resolved_spec.get("plot_type", "line"),
+                template=resolved_spec.get("template", "plotly_white"),
+                title=resolved_spec.get("title"),
+                styles=resolved_spec.get("styles"),
+                enable_secondary_axis=resolved_spec.get("enable_secondary_axis", False),
+                yaxis_title_1=resolved_spec.get("yaxis_title_1"),
+                yaxis_title_2=resolved_spec.get("yaxis_title_2"),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Plot {i}: error while rendering: {e}")
 
 
 if __name__ == "__main__":
